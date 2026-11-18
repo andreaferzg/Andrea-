@@ -114,6 +114,7 @@ AR02_OUTPUT_HEADERS = [
     "CONTROL CUENTA AR02",
     "FILA AR02 ORIGEN",
     "RUTA VALIDACIÓN AR02",
+    "OBSERVACIÓN ASIGNACIÓN",
     "PLACA ANTIGUA IH08",
     "AF R3 (ANTIGUO)",
     "ORIGEN AF R3",
@@ -127,6 +128,24 @@ AR02_OUTPUT_HEADERS = [
     "COMPARACIÓN AR02 HANA VS ANTIGUO",
     "FILA AR02 ANTIGUO ORIGEN",
 ]
+# Asignación por descripción + centro para fichas sin activo (BASE vs AR02).
+# Se compara la descripción de la ficha con la denominación del AR02 SOLO
+# dentro del mismo centro, con fuzz.token_sort_ratio (penaliza textos de
+# distinto largo, a diferencia de WRatio que da 90 a 'ELECTROBOMBA').
+#  - puntaje >= DESCRIPTION_VALIDATE_SCORE  -> VALIDADO AR02 (llena STATUS)
+#  - puntaje >= DESCRIPTION_SUGGEST_SCORE   -> SUGERIDO POR DESCRIPCIÓN
+#    (se muestra el activo, pero no se escribe en el STATUS ni en ACDOCA)
+# Siempre se exige: candidato único (sin empate ni otro a menos de
+# DESCRIPTION_MIN_GAP puntos), los números de ambos textos compatibles
+# (N°1 ≠ N°2), y que el activo no esté tomado por otra ficha.
+DESCRIPTION_VALIDATE_SCORE = 97
+DESCRIPTION_SUGGEST_SCORE = 88
+DESCRIPTION_MIN_GAP = 5
+DESCRIPTION_STATUSES = {
+    "EQUIPO SIN ACTIVO FIJO EN IH08",
+    "BASE SIN CÓDIGO DE EQUIPO",
+    "EQUIPO NO EXISTE EN IH08",
+}
 # Columnas opcionales del AR02 HANA con placas. ('Equipo Antiguo' NO se usa:
 # es la numeración de equipos de R3 y choca con los equipos actuales de IH08.)
 AR02_PLATE_HEADERS = ("Placa Activo Fijo", "Placa antigua")
@@ -556,6 +575,16 @@ def split_plates(value: Any) -> set[str]:
         if is_plate_like(plate):
             plates.add(plate)
     return plates
+
+
+def description_numbers(text: str) -> set[str]:
+    return {str(int(number)) for number in re.findall(r"\d+", text)}
+
+
+def numbers_compatible(left: str, right: str) -> bool:
+    """'BOMBA N 1' vs 'BOMBA N 2' -> False. Si uno no tiene números, True."""
+    a, b = description_numbers(left), description_numbers(right)
+    return not a or not b or a <= b or b <= a
 
 
 def read_ar02_legacy(
@@ -1801,7 +1830,12 @@ def update_status_template(
             return validation_cache[equipment]
 
         def no_hana_detail(validation: dict[str, Any]) -> str:
-            parts = [validation.get("detail", "")]
+            parts = [validation.get("detail", ""), validation.get("note", "")]
+            if validation.get("status") == "SUGERIDO POR DESCRIPCIÓN":
+                parts.append(
+                    f"Sugerido {validation['anln1']}-{validation['anln2']} "
+                    f"({validation.get('route', '')}): confirmar y escribir a mano."
+                )
             legacy = validation.get("legacy") or {}
             entry = legacy.get("entry")
             if entry is not None:
@@ -2865,8 +2899,13 @@ def generate() -> Path:
             if part
         )
         route = validation.get("route", "")
+        observation = " ".join(
+            part
+            for part in (validation.get("detail", ""), validation.get("note", ""))
+            if part
+        )
         if not code:
-            return [route, legacy.get("plate", ""), "", source, *[""] * 9]
+            return [route, observation, legacy.get("plate", ""), "", source, *[""] * 9]
         shown_code = f"{code}-{key[1]}" if key else code
         if entry is None:
             state = (
@@ -2874,9 +2913,12 @@ def generate() -> Path:
                 if ar02_legacy
                 else "SIN ARCHIVO AR02 ANTIGUO"
             )
-            return [route, legacy.get("plate", ""), shown_code, source, state, *[""] * 8]
+            return [
+                route, observation, legacy.get("plate", ""), shown_code, source,
+                state, *[""] * 8,
+            ]
         record = validation.get("record")
-        if validation["status"] != "VALIDADO AR02" or record is None:
+        if record is None:
             comparison = "SOLO EN AR02 ANTIGUO"
         else:
             def hana_amount(header: str) -> Decimal:
@@ -2895,6 +2937,7 @@ def generate() -> Path:
                 comparison = "DIFERENTE"
         return [
             route,
+            observation,
             legacy.get("plate", ""),
             shown_code,
             source,
@@ -3361,15 +3404,15 @@ def generate() -> Path:
     matched_count = 0
     recovered_base_rows: list[list[Any]] = []
 
+    # Paso 1: validación por IH08 / AF R3 / placa para todas las fichas.
+    initial_validations: dict[int, dict[str, Any]] = {}
     for base_record, base_source_row in zip(base_records, base_source_rows):
         key = normalize_key(
             base_record[BASE_EQUIPMENT_COLUMN - 1]
             if len(base_record) >= BASE_EQUIPMENT_COLUMN
             else None
         )
-        export_record = export_by_equipment.get(key) if key else None
         export_rows = export_rows_by_equipment.get(key, []) if key else []
-        export_source_row = export_row_by_equipment.get(key)
         base_plates = split_plates(
             source_value(base_record, base_headers, "Código placa (si aplica)")
         )
@@ -3383,6 +3426,154 @@ def generate() -> Path:
             )
         else:
             validation = validate_ar02(export_rows or None, base_plates)
+        initial_validations[base_source_row] = validation
+
+    # Paso 2: fichas sin activo -> descripción + centro contra AR02.
+    taken_assets = {
+        (validation["anln1"], validation["anln2"])
+        for validation in initial_validations.values()
+        if validation["status"] == "VALIDADO AR02"
+    }
+    ar02_names_by_center: dict[str, list[tuple[str, tuple[str, str], str]]] = {}
+    for (asset_code, subnumber), rows in ar02_by_key.items():
+        if len(rows) != 1:
+            continue
+        denomination = cell_text(rows[0][1][ar02_column_indices["denom"]])
+        normalized = normalize_search_text(denomination)
+        if normalized:
+            ar02_names_by_center.setdefault(
+                normalize_key(rows[0][1][ar02_column_indices["center"]]), []
+            ).append((normalized, (asset_code, subnumber), denomination))
+
+    def base_center(base_record: list[Any], equipment: str) -> str:
+        texts = [
+            cell_text(source_value(base_record, base_headers, name))
+            for name in (
+                "Procedencia del Equipo (Planta/ Embarcación)",
+                "Ubicación técnica del equipo",
+            )
+        ]
+        for text in texts:
+            match = re.search(r"\b(AG|FL)\s*(\d{2})\b", text, re.IGNORECASE)
+            if match:
+                return f"{match.group(1)}{match.group(2)}".casefold()
+        record = export_by_equipment.get(equipment) if equipment else None
+        if record is not None:
+            return normalize_key(
+                source_value(record, export_headers, "Centro planificación")
+            )
+        return ""
+
+    description_proposals: dict[int, dict[str, Any]] = {}
+    for base_record, base_source_row in zip(base_records, base_source_rows):
+        validation = initial_validations[base_source_row]
+        if validation["status"] not in DESCRIPTION_STATUSES:
+            continue
+        description = cell_text(
+            source_value(base_record, base_headers, "Descripción del equipo")
+        )
+        query = normalize_search_text(description)
+        equipment = normalize_key(
+            base_record[BASE_EQUIPMENT_COLUMN - 1]
+            if len(base_record) >= BASE_EQUIPMENT_COLUMN
+            else None
+        )
+        center = base_center(base_record, equipment)
+        candidates = ar02_names_by_center.get(center, [])
+        if not query or not candidates:
+            continue
+        scored = sorted(
+            (
+                (fuzz.token_sort_ratio(query, name), name, asset_key, denomination)
+                for name, asset_key, denomination in candidates
+                if numbers_compatible(query, name)
+            ),
+            reverse=True,
+        )
+        if not scored or scored[0][0] < DESCRIPTION_SUGGEST_SCORE:
+            continue
+        best_score, best_name, best_key, best_denomination = scored[0]
+        rivals = [
+            item for item in scored[1:]
+            if item[0] > best_score - DESCRIPTION_MIN_GAP
+        ]
+        description_proposals[base_source_row] = {
+            "score": round(best_score, 1),
+            "key": best_key,
+            "denomination": best_denomination,
+            "center": center,
+            "rivals": rivals,
+        }
+
+    claims = Counter(
+        proposal["key"]
+        for proposal in description_proposals.values()
+        if not proposal["rivals"]
+    )
+    for base_source_row, proposal in description_proposals.items():
+        validation = initial_validations[base_source_row]
+        asset_key = proposal["key"]
+        reason = ""
+        if proposal["rivals"]:
+            reason = "empate con " + ", ".join(
+                f"{key[0]}-{key[1]} '{denomination}' ({round(score, 1)})"
+                for score, _, key, denomination in proposal["rivals"][:3]
+            )
+        elif asset_key in taken_assets:
+            reason = "el activo ya está asignado a otra ficha por IH08"
+        elif claims[asset_key] > 1:
+            reason = f"el mismo activo lo piden {claims[asset_key]} fichas"
+        label = (
+            f"DESCRIPCIÓN + CENTRO {proposal['center'].upper()} "
+            f"(puntaje {proposal['score']})"
+        )
+        if reason:
+            validation["note"] = (
+                f"Candidato por descripción {asset_key[0]}-{asset_key[1]} "
+                f"'{proposal['denomination']}' ({label}) NO asignado: {reason}."
+            )
+            continue
+        matches = ar02_by_key[asset_key]
+        status = (
+            "VALIDADO AR02"
+            if proposal["score"] >= DESCRIPTION_VALIDATE_SCORE
+            else "SUGERIDO POR DESCRIPCIÓN"
+        )
+        new_validation = {
+            "status": status,
+            "anln1": asset_key[0],
+            "anln2": asset_key[1],
+            "source_row": matches[0][0],
+            "record": matches[0][1],
+            "route": label,
+            "detail": f"Antes: {validation['status']}.",
+            "legacy": validation.get("legacy", {}),
+        }
+        mapped = legacy_by_hana.get(asset_key)
+        if mapped and not new_validation["legacy"].get("code"):
+            legacy_key, legacy_entry = find_legacy_entry(*mapped)
+            new_validation["legacy"] = {
+                **new_validation["legacy"],
+                "code": mapped[0],
+                "subnumber": mapped[1],
+                "source": "AR02 HANA: Activo fijo orig.",
+                "key": legacy_key,
+                "entry": legacy_entry,
+            }
+        initial_validations[base_source_row] = new_validation
+        if status == "VALIDADO AR02":
+            taken_assets.add(asset_key)
+
+    for base_record, base_source_row in zip(base_records, base_source_rows):
+        key = normalize_key(
+            base_record[BASE_EQUIPMENT_COLUMN - 1]
+            if len(base_record) >= BASE_EQUIPMENT_COLUMN
+            else None
+        )
+        export_record = export_by_equipment.get(key) if key else None
+        export_rows = export_rows_by_equipment.get(key, []) if key else []
+        export_source_row = export_row_by_equipment.get(key)
+        validation = initial_validations[base_source_row]
         validations_by_base_row[base_source_row] = validation
         reconciliation = reconcile_record(
             base_record,
@@ -4133,9 +4324,16 @@ def generate() -> Path:
         for source_row, validation in validations_by_base_row.items()
         if validation.get("detail", "").startswith("Antes:")
     ]
+    def route_group(validation: dict[str, Any]) -> str:
+        route = validation["route"]
+        if route.startswith("PLACA "):
+            return "PLACA → AR02"
+        if route.startswith("DESCRIPCIÓN"):
+            return f"DESCRIPCIÓN + CENTRO → {validation['status']}"
+        return route
+
     legacy_route_counts = Counter(
-        re.sub(r"^PLACA .* → AR02$", "PLACA → AR02", validations_by_base_row[row]["route"])
-        for row in legacy_route_rows
+        route_group(validations_by_base_row[row]) for row in legacy_route_rows
     )
     legacy_comparison_counts = Counter(
         ar02_column(row, "COMPARACIÓN AR02 HANA VS ANTIGUO")
@@ -4385,7 +4583,7 @@ def generate() -> Path:
         "DENOMINACIÓN AR02",
         "CAP ACTUALES AR02",
         "VALCONT ACTUAL AR02",
-        "DETALLE VALIDACIÓN",
+        "DESCRIPCIÓN FICHA",
         *AR02_OUTPUT_HEADERS[AR02_OUTPUT_HEADERS.index("RUTA VALIDACIÓN AR02"):],
     ]
     legacy_sheet_records: list[list[Any]] = []
@@ -4396,6 +4594,7 @@ def generate() -> Path:
             ar02_column(row, "AF R3 (ANTIGUO)")
             or ar02_column(row, "PLACA ANTIGUA IH08")
             or validation.get("detail", "").startswith("Antes:")
+            or validation.get("note")
         ):
             continue
         legacy_sheet_records.append(
@@ -4410,20 +4609,22 @@ def generate() -> Path:
                 ar02_column(row, "DENOMINACIÓN AR02"),
                 ar02_column(row, "CAP ACTUALES AR02"),
                 ar02_column(row, "VALCONT ACTUAL AR02"),
-                validation.get("detail", ""),
+                cell_text(
+                    source_value(base_record, base_headers, "Descripción del equipo")
+                ),
                 *row[AR02_OUTPUT_HEADERS.index("RUTA VALIDACIÓN AR02"):],
             ]
         )
     add_records_sheet(
         workbook,
-        "AR02 ANTIGUO - CRUCE",
+        "RECUPERACIÓN DE ACTIVOS",
         legacy_sheet_headers,
         legacy_sheet_records,
         "CruceAR02Antiguo",
         (
             f"AR02 ANTIGUO: "
             f"{ar02_legacy_path.name if ar02_legacy_path else 'no encontrado'}  |  "
-            f"{len(legacy_sheet_records)} filas BASE con placa antigua / AF R3  |  "
+            f"{len(legacy_sheet_records)} fichas con AF R3, placa o candidato  |  "
             f"{len(legacy_route_rows)} recuperadas por rutas nuevas"
         ),
         [
