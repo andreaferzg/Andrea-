@@ -26,10 +26,13 @@ AR02_FOLDER = ROOT / "AR02"
 # AR02 de R3 (antes de la migración a HANA). Opcional: si la carpeta no
 # existe o está vacía, el cruce con el AR02 antiguo simplemente se omite.
 AR02_LEGACY_FOLDER = ROOT / "AR02 ANTIGUO"
-# Si el activo HANA está con todos sus valores en 0 (migración R3 → HANA mal
-# hecha) y el AR02 ANTIGUO sí tiene valor, ¿usar el valor antiguo como VALOR
-# CONTABLE del STATUS? En False solo se avisa en STATUS - REVISAR.
-USE_LEGACY_BOOK_VALUE_WHEN_HANA_IS_ZERO = False
+# Regla de VALOR CONTABLE con la migración R3 → HANA:
+#  - Activo HANA capitalizado entre estas fechas (migración) y SIN ningún
+#    valor contable (todo en 0) -> se usa el valor del AR02 ANTIGUO.
+#  - Si el activo HANA sí tiene valores y su Val.cont.act. es 0 (depreciado)
+#    -> se usa el 0 de HANA.
+MIGRATION_CAPITALIZED_FROM = (2025, 11)
+MIGRATION_CAPITALIZED_TO = (2025, 12)
 # Encabezados (normalizados con normalize_header) que se reconocen como
 # "placa antigua" en IH08 y como "N.º de activo antiguo (R3)" en el AR02 nuevo.
 IH08_LEGACY_PLATE_HEADERS = {
@@ -132,13 +135,12 @@ AR02_OUTPUT_HEADERS = [
 # Se compara la descripción de la ficha con la denominación del AR02 SOLO
 # dentro del mismo centro, con fuzz.token_sort_ratio (penaliza textos de
 # distinto largo, a diferencia de WRatio que da 90 a 'ELECTROBOMBA').
-#  - puntaje >= DESCRIPTION_VALIDATE_SCORE  -> VALIDADO AR02 (llena STATUS)
-#  - puntaje >= DESCRIPTION_SUGGEST_SCORE   -> SUGERIDO POR DESCRIPCIÓN
-#    (se muestra el activo, pero no se escribe en el STATUS ni en ACDOCA)
+#  - puntaje >= DESCRIPTION_SUGGEST_SCORE -> VALIDADO AR02, pero marcado
+#    como SUGERIDO (ruta 'SUGERIDO: ...', celda naranja en el STATUS).
+#  - Fichas de flota (FLxx) también buscan en AG09.
 # Siempre se exige: candidato único (sin empate ni otro a menos de
 # DESCRIPTION_MIN_GAP puntos), los números de ambos textos compatibles
 # (N°1 ≠ N°2), y que el activo no esté tomado por otra ficha.
-DESCRIPTION_VALIDATE_SCORE = 97
 DESCRIPTION_SUGGEST_SCORE = 88
 DESCRIPTION_MIN_GAP = 5
 DESCRIPTION_STATUSES = {
@@ -200,6 +202,14 @@ STATUS_HEADERS = [
     "N° FACTURA VENTAS",
     "FECHA",
 ]
+# Colores en el STATUS: amarillo = dato nuevo; morado = activo que ya figura
+# dado de baja en AR02; verde = HANAH del STATUS distinto al de IH08;
+# naranja = HANAH sugerido por descripción + centro.
+STATUS_FILL_DEFAULT = "FFFF00"
+STATUS_FILL_DISPOSED = "CC99FF"
+STATUS_FILL_MISMATCH = "92D050"
+STATUS_FILL_SUGGESTED = "FFC000"
+STATUS_NOTE_HEADER = "COMENTARIOS2"
 STATUS_TRACE_HEADERS = [
     "FILA STATUS",
     "TIPO DE FILA",
@@ -585,6 +595,11 @@ def numbers_compatible(left: str, right: str) -> bool:
     """'BOMBA N 1' vs 'BOMBA N 2' -> False. Si uno no tiene números, True."""
     a, b = description_numbers(left), description_numbers(right)
     return not a or not b or a <= b or b <= a
+
+
+def r3_codes_in(value: Any) -> set[str]:
+    """Números de activo R3 (10 dígitos) escritos como placa antigua."""
+    return set(re.findall(r"(?<!\d)\d{10}(?!\d)", cell_text(value)))
 
 
 def read_ar02_legacy(
@@ -1126,11 +1141,14 @@ def add_records_sheet(
     )
 
 
+KEEP_VALUE = object()  # en updates: solo cambiar el color, no el valor
+
+
 def save_template_cells(
     template_path: Path,
     output_path: Path,
     sheet_name: str,
-    updates: list[tuple[str, Any, bool]],
+    updates: list[tuple[str, Any, bool, str]],
     new_rows: list[tuple[int, dict[int, tuple[Any, bool]]]],
     style_source_row: int,
     filter_header_row: int | None = None,
@@ -1187,29 +1205,29 @@ def save_template_cells(
         )
         if fills_match is None or formats_match is None:
             raise ValueError("La plantilla STATUS no contiene estilos de celdas.")
-        fills_xml = fills_match.group(1)
-        fill_tags = re.findall(rb"<fill\b[^>]*>.*?</fill>", fills_xml, re.DOTALL)
-        yellow_fill_id = next(
-            (
-                index
-                for index, fill in enumerate(fill_tags)
-                if re.search(rb"<patternFill\b[^>]*\bpatternType=\"solid\"", fill)
-                and re.search(
-                    rb"<fgColor\b[^>]*\brgb=\"(?:FF)?FFFF00\"", fill, re.IGNORECASE
-                )
-            ),
-            None,
-        )
-        if yellow_fill_id is None:
-            yellow_fill_id = len(fill_tags)
-            fill_xml = (
-                b'<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/>'
-                b'<bgColor indexed="64"/></patternFill></fill>'
+        fill_ids: dict[str, int] = {}
+
+        def ensure_fill(color: str) -> int:
+            nonlocal styles_xml
+            fills_match = re.search(
+                rb"<fills\b[^>]*>(.*?)</fills>", styles_xml, re.DOTALL
             )
-            fills_xml += fill_xml
+            fills_xml = fills_match.group(1)
+            fill_tags = re.findall(rb"<fill\b[^>]*>.*?</fill>", fills_xml, re.DOTALL)
+            for index, fill in enumerate(fill_tags):
+                if re.search(
+                    rb"<patternFill\b[^>]*\bpatternType=\"solid\"", fill
+                ) and re.search(
+                    rb"<fgColor\b[^>]*\brgb=\"(?:FF)?" + color.encode() + rb"\"",
+                    fill,
+                    re.IGNORECASE,
+                ):
+                    return index
+            fills_xml += (
+                f'<fill><patternFill patternType="solid"><fgColor rgb="FF{color}"/>'
+                f'<bgColor indexed="64"/></patternFill></fill>'
+            ).encode()
             fills_open = re.search(rb"<fills\b[^>]*>", styles_xml)
-            if fills_open is None:
-                raise ValueError("No se encontró la sección fills de los estilos.")
             fills_open_xml = re.sub(
                 rb"\bcount=\"\d+\"",
                 f'count="{len(fill_tags) + 1}"'.encode(),
@@ -1225,11 +1243,16 @@ def save_template_cells(
                 + b"</fills>"
                 + styles_xml[fills_match.end() :]
             )
-            formats_match = re.search(
-                rb"<cellXfs\b([^>]*)>(.*?)</cellXfs>", styles_xml, re.DOTALL
-            )
-            if formats_match is None:
-                raise ValueError("No se pudo actualizar la sección de estilos.")
+            return len(fill_tags)
+
+        for color in sorted({STATUS_FILL_DEFAULT, *(update[3] for update in updates)}):
+            fill_ids[color] = ensure_fill(color)
+        yellow_fill_id = fill_ids[STATUS_FILL_DEFAULT]
+        formats_match = re.search(
+            rb"<cellXfs\b([^>]*)>(.*?)</cellXfs>", styles_xml, re.DOTALL
+        )
+        if formats_match is None:
+            raise ValueError("No se pudo actualizar la sección de estilos.")
 
         cell_formats: list[bytes] = []
         cursor = 0
@@ -1425,7 +1448,8 @@ def save_template_cells(
                     + dimension_xml
                     + sheet_xml[dimension_match.end() :]
                 )
-        for coordinate, value, is_numeric in updates:
+        for coordinate, value, is_numeric, color in updates:
+            target_fill_id = fill_ids[color]
             match = re.fullmatch(r"([A-Z]+)(\d+)", coordinate)
             if match is None:
                 raise ValueError(f"Referencia de celda inválida: {coordinate}")
@@ -1454,7 +1478,7 @@ def save_template_cells(
                     f"Estilo de celda inválido en {coordinate}: {original_style_id}"
                 )
             is_date = isinstance(value, datetime)
-            style_key = (original_style_id, is_date)
+            style_key = (original_style_id, is_date, color)
             if style_key not in style_by_original:
                 original_format = cell_formats[original_style_id]
                 if is_date:
@@ -1474,7 +1498,7 @@ def save_template_cells(
                 current_fill_id = int(fill_match.group(1)) if fill_match else 0
                 apply_fill = re.search(rb"\bapplyFill=\"([^\"]+)\"", original_format)
                 if (
-                    current_fill_id == yellow_fill_id
+                    current_fill_id == target_fill_id
                     and apply_fill is not None
                     and apply_fill.group(1) == b"1"
                     and not is_date
@@ -1483,14 +1507,14 @@ def save_template_cells(
                 else:
                     updated_format, replacements = re.subn(
                         rb"\bfillId=\"\d+\"",
-                        f'fillId="{yellow_fill_id}"'.encode(),
+                        f'fillId="{target_fill_id}"'.encode(),
                         original_format,
                         count=1,
                     )
                     if replacements == 0:
                         updated_format = re.sub(
                             rb"<xf\b",
-                            f'<xf fillId="{yellow_fill_id}"'.encode(),
+                            f'<xf fillId="{target_fill_id}"'.encode(),
                             original_format,
                             count=1,
                         )
@@ -1513,7 +1537,22 @@ def save_template_cells(
                     )
                     appended_formats.append(updated_format)
             style_id = style_by_original[style_key]
-            if is_date:
+            if value is KEEP_VALUE:
+                if existing_cell is not None:
+                    old_cell = existing_cell.group(0)
+                    open_tag = re.match(rb"<c\b[^>]*?/?>", old_cell).group(0)
+                    if re.search(rb"\bs=\"\d+\"", open_tag):
+                        new_open = re.sub(
+                            rb"\bs=\"\d+\"", f's="{style_id}"'.encode(), open_tag, count=1
+                        )
+                    else:
+                        new_open = open_tag.replace(
+                            b"<c ", f'<c s="{style_id}" '.encode(), 1
+                        )
+                    cell_xml = new_open + old_cell[len(open_tag):]
+                else:
+                    cell_xml = f'<c r="{coordinate}" s="{style_id}"/>'.encode()
+            elif is_date:
                 cell_xml = (
                     f'<c r="{coordinate}" s="{style_id}">'
                     f"<v>{excel_serial(value)}</v></c>"
@@ -1722,6 +1761,7 @@ def update_status_template(
     hana_from_r3: Any = None,
     legacy_book_info: Any = None,
     r3_legacy_detail: Any = None,
+    asset_disposed: Any = None,
 ) -> dict[str, Any]:
     """Completa el STATUS sin tocar lo existente.
 
@@ -1829,13 +1869,35 @@ def update_status_template(
                 validation_cache[equipment] = resolve_equipment(equipment)
             return validation_cache[equipment]
 
+        def hana_flags(
+            hana: str, validation: dict[str, Any]
+        ) -> tuple[str, list[str]]:
+            """Color y notas para la celda CODIGO AF HANAH."""
+            color, notes = STATUS_FILL_DEFAULT, []
+            if validation.get("suggested") and validation.get("anln1") == hana:
+                color = STATUS_FILL_SUGGESTED
+                notes.append(
+                    f"AF HANAH SUGERIDO ({validation.get('route', '')}); confirmar."
+                )
+            if asset_disposed and asset_disposed(hana):
+                color = STATUS_FILL_DISPOSED
+                notes.append(
+                    f"Activo {hana} ya se dio de baja anteriormente (AR02)."
+                )
+            return color, notes
+
+        def mark(row_number: int, equipment: str, header: str, color: str, reason: str) -> None:
+            updates.append(
+                (f"{letter(header)}{row_number}", KEEP_VALUE, False, color)
+            )
+            trace.append(
+                [row_number, "EXISTENTE (solo color)", equipment, header, "", reason]
+            )
+
         def no_hana_detail(validation: dict[str, Any]) -> str:
             parts = [validation.get("detail", ""), validation.get("note", "")]
-            if validation.get("status") == "SUGERIDO POR DESCRIPCIÓN":
-                parts.append(
-                    f"Sugerido {validation['anln1']}-{validation['anln2']} "
-                    f"({validation.get('route', '')}): confirmar y escribir a mano."
-                )
+            if validation.get("status") == "EQUIPO SIN ACTIVO FIJO EN IH08":
+                parts.append("Falta cargar el activo fijo en SAP (IH08).")
             legacy = validation.get("legacy") or {}
             entry = legacy.get("entry")
             if entry is not None:
@@ -1914,9 +1976,10 @@ def update_status_template(
             header: str,
             value: Any,
             source: str,
+            color: str = STATUS_FILL_DEFAULT,
         ) -> None:
             numeric = header in {"VALOR CONTABLE", "N° DE DOCUMENTO"}
-            updates.append((f"{letter(header)}{row_number}", value, numeric))
+            updates.append((f"{letter(header)}{row_number}", value, numeric, color))
             fill_counts[header] += 1
             shown = value.strftime("%m/%Y") if isinstance(value, datetime) else value
             trace.append([row_number, row_type, equipment, header, shown, source])
@@ -2029,6 +2092,7 @@ def update_status_template(
                 return bool(cell_text(existing_value(row_number, header)))
 
             row_fills: list[tuple[str, Any, str]] = []
+            row_colors: dict[str, str] = {}
             validation = resolve(equipment)
             r3_code = cell_text(existing_value(row_number, "CODIGO AF R3"))
             if re.fullmatch(r"\d{12}", hana):
@@ -2048,6 +2112,21 @@ def update_status_template(
                             "No se modificó.",
                         ]
                     )
+                    mismatch_note = (
+                        f"REVISAR: HANAH del STATUS {hana} "
+                        f"({asset_denomination(hana)}) ≠ IH08 "
+                        f"{validation['anln1']} "
+                        f"({asset_denomination(validation['anln1'])})."
+                    )
+                    mark(
+                        row_number, equipment, "CODIGO AF HANAH",
+                        STATUS_FILL_MISMATCH, mismatch_note,
+                    )
+                    if not already_filled(STATUS_NOTE_HEADER):
+                        row_colors[STATUS_NOTE_HEADER] = STATUS_FILL_MISMATCH
+                        row_fills.append(
+                            (STATUS_NOTE_HEADER, mismatch_note, "STATUS vs IH08")
+                        )
             elif not already_filled("CODIGO AF HANAH"):
                 if validation.get("status") == "VALIDADO AR02":
                     hana = validation["anln1"]
@@ -2157,8 +2236,23 @@ def update_status_template(
                     if cell_text(value) and not already_filled(header):
                         row_fills.append((header, cell_text(value), source))
 
+            filled_hana = next(
+                (value for header, value, _ in row_fills if header == "CODIGO AF HANAH"),
+                "",
+            )
+            if filled_hana:
+                color, notes = hana_flags(filled_hana, validation)
+                row_colors["CODIGO AF HANAH"] = color
+                if notes and not already_filled(STATUS_NOTE_HEADER) and not any(
+                    header == STATUS_NOTE_HEADER for header, _, _ in row_fills
+                ):
+                    row_colors[STATUS_NOTE_HEADER] = color
+                    row_fills.append((STATUS_NOTE_HEADER, " ".join(notes), "Nota AF HANAH"))
             for header, value, source in row_fills:
-                record_fill(row_number, "EXISTENTE", equipment, header, value, source)
+                record_fill(
+                    row_number, "EXISTENTE", equipment, header, value, source,
+                    row_colors.get(header, STATUS_FILL_DEFAULT),
+                )
             if row_fills:
                 filled_existing_rows += 1
 
@@ -2199,13 +2293,20 @@ def update_status_template(
                     ]
                 )
             else:
+                if candidate.get("material"):
+                    values["CODIGO AF HANAH"] = (
+                        "Activo fijo no encontrado en base",
+                        "Ficha sin código de equipo, con código de material "
+                        f"{candidate['material']}",
+                    )
                 review.append(
                     [
                         row_number,
                         "",
                         "",
                         "SIN HANAH: FICHA SIN CÓDIGO DE EQUIPO",
-                        "Ver hoja CANDIDATOS AR02 (sugerencias por descripción).",
+                        no_hana_detail(validation)
+                        or "Ver hoja CANDIDATOS AR02 (sugerencias por descripción).",
                     ]
                 )
             legacy = validation.get("legacy") or {}
@@ -2225,6 +2326,13 @@ def update_status_template(
                 ):
                     values[header] = (value, source)
 
+            new_colors: dict[str, str] = {}
+            if hana:
+                color, notes = hana_flags(hana, validation)
+                new_colors["CODIGO AF HANAH"] = color
+                if notes and STATUS_NOTE_HEADER not in values:
+                    new_colors[STATUS_NOTE_HEADER] = color
+                    values[STATUS_NOTE_HEADER] = (" ".join(notes), "Nota AF HANAH")
             row_values: dict[int, tuple[Any, bool]] = {}
             for header in STATUS_HEADERS:
                 if header not in values:
@@ -2241,6 +2349,7 @@ def update_status_template(
                     header,
                     value,
                     source,
+                    new_colors.get(header, STATUS_FILL_DEFAULT),
                 )
             new_rows.append((row_number, row_values))
             appended_base_rows += 1
@@ -2704,6 +2813,22 @@ def generate() -> Path:
             if index is not None
         )
 
+    def migrated_without_values(record: list[Any]) -> bool:
+        """Activo HANA capitalizado en la migración (nov-dic 2025) y en 0."""
+        text = cell_text(record[ar02_column_indices["capitalized"]])
+        iso = re.match(r"(\d{4})-(\d{2})", text)
+        local = re.search(r"\d{2}[./-](\d{2})[./-](\d{4})", text)
+        if iso:
+            year, month = int(iso.group(1)), int(iso.group(2))
+        elif local:
+            month, year = int(local.group(1)), int(local.group(2))
+        else:
+            return False
+        return (
+            MIGRATION_CAPITALIZED_FROM <= (year, month) <= MIGRATION_CAPITALIZED_TO
+            and ar02_is_zero(record)
+        )
+
     def ih08_legacy_plate(rows: list[tuple[int, list[Any]]]) -> str:
         if ih08_plate_index is None:
             return ""
@@ -2747,6 +2872,7 @@ def generate() -> Path:
         rows: list[tuple[int, list[Any]]] | None,
         extra_plates: set[str] | frozenset[str] = frozenset(),
         equipment: str = "",
+        extra_r3: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """Respaldo cuando IH08 no lleva a un activo válido en AR02, o cuando
         el activo HANA tiene todos sus valores en 0. Se prueba, en orden:
@@ -2768,6 +2894,14 @@ def generate() -> Path:
             )
         if not plate_code:
             plates |= split_plates(plate_raw)
+        # Placas antiguas que son un número de activo R3 (5xxxxxxxxx).
+        plate_r3 = set(extra_r3)
+        for _, record in rows:
+            plate_r3 |= r3_codes_in(
+                source_value(record, export_headers, "Número de inventario")
+            )
+        plate_r3.discard(plate_code)
+        plate_r3 = sorted(plate_r3)
         if not equipment and rows:
             equipment = normalize_key(rows[0][1][EXPORT_EQUIPMENT_COLUMN - 1])
 
@@ -2798,10 +2932,20 @@ def generate() -> Path:
             routes.append(
                 ("IH08 PLACA ANTIGUA → AF R3 → AR02", hana_from_legacy(plate_code, plate_sub)[0])
             )
+        for code in plate_r3:
+            routes.append(
+                (f"PLACA R3 {code} → AF R3 → AR02", hana_from_legacy(code, "")[0])
+            )
         if ih08_r3:
             routes.append(
                 ("IH08 ACTIVO FIJO R3 → AF R3 → AR02", hana_from_legacy(ih08_r3, "")[0])
             )
+        for code in [plate_code, *plate_r3]:
+            if code.startswith("4"):
+                notes.append(
+                    f"AF R3 {code} empieza con 4: ese tipo de activo ya no "
+                    "debería existir."
+                )
         plate_keys = sorted(
             {key for plate in plates for key in ar02_by_plate.get(plate, ())}
         )
@@ -2866,6 +3010,8 @@ def generate() -> Path:
             r3_source = "AR02 HANA: Activo fijo orig."
         elif ih08_r3:
             r3_code, r3_sub, r3_source = ih08_r3, "", "IH08 Activo fijo con número R3"
+        elif plate_r3:
+            r3_code, r3_sub, r3_source = plate_r3[0], "", "Placa antigua R3 (IH08 / BASE)"
         else:
             r3_code, r3_sub, r3_source = "", "", ""
         legacy_key, legacy_entry = find_legacy_entry(
@@ -2886,8 +3032,11 @@ def generate() -> Path:
     def validate_ar02(
         rows: list[tuple[int, list[Any]]] | None,
         extra_plates: set[str] | frozenset[str] = frozenset(),
+        extra_r3: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
-        return apply_fallbacks(validate_ar02_primary(rows), rows, extra_plates)
+        return apply_fallbacks(
+            validate_ar02_primary(rows), rows, extra_plates, "", extra_r3
+        )
 
     def legacy_output(validation: dict[str, Any]) -> list[Any]:
         legacy = validation.get("legacy") or {}
@@ -2899,9 +3048,20 @@ def generate() -> Path:
             if part
         )
         route = validation.get("route", "")
+        disposed_note = (
+            "Activo ya se dio de baja anteriormente (AR02)."
+            if validation.get("record") is not None
+            and ar02_asset_state(validation["record"], ar02_header_indices)
+            == "BAJA EN AR02"
+            else ""
+        )
         observation = " ".join(
             part
-            for part in (validation.get("detail", ""), validation.get("note", ""))
+            for part in (
+                disposed_note,
+                validation.get("detail", ""),
+                validation.get("note", ""),
+            )
             if part
         )
         if not code:
@@ -2927,8 +3087,14 @@ def generate() -> Path:
 
             cap = hana_amount("CAP actuales")
             book = hana_amount("Val.cont.act.")
-            if ar02_is_zero(record) and (entry["cap"] != 0 or entry["valcont"] != 0):
+            if migrated_without_values(record):
+                comparison = (
+                    "USAR AR02 ANTIGUO: migrado nov-dic 2025 sin valores en HANA"
+                )
+            elif ar02_is_zero(record) and entry["valcont"] != 0:
                 comparison = "REVISAR: HANA EN 0, ANTIGUO CON VALOR"
+            elif ar02_is_zero(record) and entry["cap"] != 0:
+                comparison = "VALOR 0 EN AMBOS (HANA sin costo, R3 depreciado)"
             elif abs(cap - entry["cap"]) <= Decimal("0.01") and abs(
                 book - entry["valcont"]
             ) <= Decimal("0.01"):
@@ -3413,19 +3579,21 @@ def generate() -> Path:
             else None
         )
         export_rows = export_rows_by_equipment.get(key, []) if key else []
-        base_plates = split_plates(
-            source_value(base_record, base_headers, "Código placa (si aplica)")
+        base_plate_text = source_value(
+            base_record, base_headers, "Código placa (si aplica)"
         )
+        base_plates = split_plates(base_plate_text)
+        base_r3 = r3_codes_in(base_plate_text)
         if not key:
             validation = apply_fallbacks(
-                {"status": "BASE SIN CÓDIGO DE EQUIPO"}, None, base_plates
+                {"status": "BASE SIN CÓDIGO DE EQUIPO"}, None, base_plates, "", base_r3
             )
         elif key not in ih08_equipment_seen:
             validation = apply_fallbacks(
-                {"status": "EQUIPO NO EXISTE EN IH08"}, None, base_plates, key
+                {"status": "EQUIPO NO EXISTE EN IH08"}, None, base_plates, key, base_r3
             )
         else:
-            validation = validate_ar02(export_rows or None, base_plates)
+            validation = validate_ar02(export_rows or None, base_plates, base_r3)
         initial_validations[base_source_row] = validation
 
     # Paso 2: fichas sin activo -> descripción + centro contra AR02.
@@ -3444,6 +3612,16 @@ def generate() -> Path:
             ar02_names_by_center.setdefault(
                 normalize_key(rows[0][1][ar02_column_indices["center"]]), []
             ).append((normalized, (asset_code, subnumber), denomination))
+
+    def subnumbers_text(asset_code: str) -> str:
+        rows = ar02_by_asset.get(asset_code, [])
+        if len(rows) <= 1:
+            return f"El activo {asset_code} no tiene otros subnúmeros."
+        return f"Subnúmeros de {asset_code} (¿overhaul?): " + "; ".join(
+            f"{cell_text(record[ar02_column_indices['anln2']])} "
+            f"'{cell_text(record[ar02_column_indices['denom']])}'"
+            for _, record in rows
+        )
 
     def base_center(base_record: list[Any], equipment: str) -> str:
         texts = [
@@ -3479,7 +3657,10 @@ def generate() -> Path:
             else None
         )
         center = base_center(base_record, equipment)
-        candidates = ar02_names_by_center.get(center, [])
+        candidates = list(ar02_names_by_center.get(center, []))
+        if center.startswith("fl"):
+            # La flota también tiene activos registrados en AG09.
+            candidates += ar02_names_by_center.get("ag09", [])
         if not query or not candidates:
             continue
         scored = sorted(
@@ -3520,11 +3701,17 @@ def generate() -> Path:
                 for score, _, key, denomination in proposal["rivals"][:3]
             )
         elif asset_key in taken_assets:
-            reason = "el activo ya está asignado a otra ficha por IH08"
+            reason = (
+                "el activo ya está asignado a otra ficha por IH08. "
+                + subnumbers_text(asset_key[0])
+            )
         elif claims[asset_key] > 1:
-            reason = f"el mismo activo lo piden {claims[asset_key]} fichas"
+            reason = (
+                f"el mismo activo lo piden {claims[asset_key]} fichas. "
+                + subnumbers_text(asset_key[0])
+            )
         label = (
-            f"DESCRIPCIÓN + CENTRO {proposal['center'].upper()} "
+            f"SUGERIDO: DESCRIPCIÓN + CENTRO {proposal['center'].upper()} "
             f"(puntaje {proposal['score']})"
         )
         if reason:
@@ -3534,13 +3721,9 @@ def generate() -> Path:
             )
             continue
         matches = ar02_by_key[asset_key]
-        status = (
-            "VALIDADO AR02"
-            if proposal["score"] >= DESCRIPTION_VALIDATE_SCORE
-            else "SUGERIDO POR DESCRIPCIÓN"
-        )
         new_validation = {
-            "status": status,
+            "status": "VALIDADO AR02",
+            "suggested": True,
             "anln1": asset_key[0],
             "anln2": asset_key[1],
             "source_row": matches[0][0],
@@ -3561,8 +3744,7 @@ def generate() -> Path:
                 "entry": legacy_entry,
             }
         initial_validations[base_source_row] = new_validation
-        if status == "VALIDADO AR02":
-            taken_assets.add(asset_key)
+        taken_assets.add(asset_key)
 
     for base_record, base_source_row in zip(base_records, base_source_rows):
         key = normalize_key(
@@ -3794,6 +3976,7 @@ def generate() -> Path:
         if not entries or not rows:
             return None
         hana_zero = all(ar02_is_zero(record) for _, record in rows)
+        migrated = any(migrated_without_values(record) for _, record in rows)
         disposal = sum(entry["baja"] for entry in entries.values())
         if disposal != 0:
             value = -(disposal + sum(e["amo_baja"] for e in entries.values()))
@@ -3804,7 +3987,8 @@ def generate() -> Path:
         codes = ", ".join(f"{code}-{sub}" for code, sub in sorted(entries))
         has_value = value != 0
         return {
-            "alert": hana_zero and has_value,
+            "use_legacy": hana_zero and migrated,
+            "alert": hana_zero and has_value and not migrated,
             "value": value,
             "source": f"{source} (R3 {codes})",
             "detail": (
@@ -3844,10 +4028,13 @@ def generate() -> Path:
         rows = ar02_by_asset.get(asset_code, [])
         if not rows:
             return None, ""
-        if USE_LEGACY_BOOK_VALUE_WHEN_HANA_IS_ZERO:
-            legacy_info = legacy_book_info(asset_code, validation)
-            if legacy_info and legacy_info["alert"]:
-                return legacy_info["value"], legacy_info["source"]
+        legacy_info = legacy_book_info(asset_code, validation)
+        if legacy_info and legacy_info["use_legacy"]:
+            return (
+                legacy_info["value"],
+                "Migrado nov-dic 2025 sin valores en HANA → "
+                + legacy_info["source"],
+            )
         disposal = sum(ar02_amount(record, "Baja") for _, record in rows)
         disposal_depreciation = sum(
             ar02_amount(record, "Amo baja") for _, record in rows
@@ -3860,6 +4047,12 @@ def generate() -> Path:
         return (
             sum(ar02_amount(record, "Val.cont.act.") for _, record in rows),
             "AR02: Val.cont.act.",
+        )
+
+    def asset_disposed(asset_code: str) -> bool:
+        return any(
+            ar02_asset_state(record, ar02_header_indices) == "BAJA EN AR02"
+            for _, record in ar02_by_asset.get(asset_code, [])
         )
 
     def asset_denomination(asset_code: str) -> str:
@@ -3949,6 +4142,7 @@ def generate() -> Path:
                 "fic": fic_number(base_id),
                 "description": get_base("Descripción del equipo"),
                 "plate": base_plate,
+                "material": cell_text(get_base("Código de material")),
                 "values": values,
                 "validation": validation,
             }
@@ -4328,8 +4522,10 @@ def generate() -> Path:
         route = validation["route"]
         if route.startswith("PLACA "):
             return "PLACA → AR02"
-        if route.startswith("DESCRIPCIÓN"):
-            return f"DESCRIPCIÓN + CENTRO → {validation['status']}"
+        if route.startswith("SUGERIDO: DESCRIPCIÓN"):
+            return "SUGERIDO: DESCRIPCIÓN + CENTRO"
+        if route.startswith("PLACA R3"):
+            return "PLACA R3 → AF R3 → AR02"
         return route
 
     legacy_route_counts = Counter(
@@ -4738,6 +4934,7 @@ def generate() -> Path:
         hana_codes_from_r3,
         legacy_book_info,
         r3_legacy_detail,
+        asset_disposed,
     )
     add_records_sheet(
         workbook,
@@ -4768,6 +4965,54 @@ def generate() -> Path:
     workbook.move_sheet("STATUS - REVISAR", offset=-(len(workbook.sheetnames) - 2))
     workbook.move_sheet(
         "STATUS - TRAZABILIDAD", offset=-(len(workbook.sheetnames) - 2)
+    )
+
+    def highlight_rows(
+        sheet_name: str, key_header: str, formula: str, color: str,
+        from_header: str | None = None,
+    ) -> None:
+        """Pinta (desde from_header hasta el final) las filas que cumplen la
+        fórmula; '{c}' se reemplaza por la columna de key_header."""
+        if sheet_name not in workbook.sheetnames:
+            return
+        worksheet = workbook[sheet_name]
+        headers = [cell.value for cell in worksheet[4]]
+        if key_header not in headers or worksheet.max_row < 5:
+            return
+        key_letter = openpyxl.utils.get_column_letter(headers.index(key_header) + 1)
+        first = (
+            headers.index(from_header) + 1
+            if from_header and from_header in headers
+            else 1
+        )
+        area = (
+            f"{openpyxl.utils.get_column_letter(first)}5:"
+            f"{openpyxl.utils.get_column_letter(len(headers))}{worksheet.max_row}"
+        )
+        worksheet.conditional_formatting.add(
+            area,
+            FormulaRule(
+                formula=[formula.format(c=f"${key_letter}5")],
+                fill=PatternFill("solid", fgColor=color),
+                stopIfTrue=True,
+            ),
+        )
+
+    for sheet_name in (
+        "Bajas completas", "Bajas sin IH08", "STATUS BAJA 2026",
+        "RECUPERACIÓN DE ACTIVOS",
+    ):
+        highlight_rows(
+            sheet_name, "ESTADO ACTIVO AR02", '{c}="BAJA EN AR02"',
+            STATUS_FILL_DISPOSED, "ESTADO VALIDACIÓN AR02",
+        )
+        highlight_rows(
+            sheet_name, "RUTA VALIDACIÓN AR02", 'LEFT({c},8)="SUGERIDO"',
+            STATUS_FILL_SUGGESTED, "ESTADO VALIDACIÓN AR02",
+        )
+    highlight_rows(
+        "STATUS - REVISAR", "ALERTA", '{c}="HANAH DEL STATUS ≠ ACTIVO DE IH08"',
+        STATUS_FILL_MISMATCH,
     )
 
     output_path = OUTPUT_FOLDER / f"Resultado_completo_{timestamp}.xlsx"
