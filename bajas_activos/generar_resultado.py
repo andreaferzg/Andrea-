@@ -23,6 +23,43 @@ ROOT = Path(__file__).resolve().parent
 BASE_FOLDER = ROOT / "BASE DESCARGADA DEL PORTAL"
 EXPORT_FOLDER = ROOT / "IH08"
 AR02_FOLDER = ROOT / "AR02"
+# AR02 de R3 (antes de la migración a HANA). Opcional: si la carpeta no
+# existe o está vacía, el cruce con el AR02 antiguo simplemente se omite.
+AR02_LEGACY_FOLDER = ROOT / "AR02 ANTIGUO"
+# Si el activo HANA está con todos sus valores en 0 (migración R3 → HANA mal
+# hecha) y el AR02 ANTIGUO sí tiene valor, ¿usar el valor antiguo como VALOR
+# CONTABLE del STATUS? En False solo se avisa en STATUS - REVISAR.
+USE_LEGACY_BOOK_VALUE_WHEN_HANA_IS_ZERO = False
+# Encabezados (normalizados con normalize_header) que se reconocen como
+# "placa antigua" en IH08 y como "N.º de activo antiguo (R3)" en el AR02 nuevo.
+IH08_LEGACY_PLATE_HEADERS = {
+    "placa antigua",
+    "placa anterior",
+    "placa r3",
+    "placa antiguo",
+    "codigo af r3",
+    "af antiguo",
+    "activo antiguo",
+    "activo fijo antiguo",
+}
+AR02_LEGACY_ASSET_HEADERS = {
+    "activo fijo antiguo",
+    "activo antiguo",
+    "af antiguo",
+    "n af antiguo",
+    "nro af antiguo",
+    "numero af antiguo",
+    "numero de af antiguo",
+    "numero activo antiguo",
+    "numero de activo antiguo",
+    "n activo antiguo",
+    "codigo af r3",
+    "activo r3",
+    "af r3",
+    "activo fijo r3",
+    "n activo fijo antiguo",
+    "numero de activo fijo antiguo",
+}
 ACDOCA_FOLDER = ROOT / "TABLA ACDOCA"
 BKPF_FOLDER = ROOT / "TABLA BKPF"
 OUTPUT_FOLDER = ROOT / "RESULTADO COMPLETO"
@@ -73,7 +110,32 @@ AR02_OUTPUT_HEADERS = [
     "CUENTAS 32/33 ACDOCA",
     "CONTROL CUENTA AR02",
     "FILA AR02 ORIGEN",
+    "RUTA VALIDACIÓN AR02",
+    "PLACA ANTIGUA IH08",
+    "AF R3 (ANTIGUO)",
+    "ORIGEN AF R3",
+    "ESTADO AR02 ANTIGUO",
+    "DENOMINACIÓN AR02 ANTIGUO",
+    "CAP ACTUALES AR02 ANTIGUO",
+    "BAJA AR02 ANTIGUO",
+    "AMO ACUMULADA AR02 ANTIGUO",
+    "VALCONT ACTUAL AR02 ANTIGUO",
+    "ESTADO ACTIVO AR02 ANTIGUO",
+    "COMPARACIÓN AR02 HANA VS ANTIGUO",
+    "FILA AR02 ANTIGUO ORIGEN",
 ]
+# Columnas del AR02 ANTIGUO (R3) que se leen; se toma la primera aparición
+# porque el archivo trae a la derecha otro bloque con nombres repetidos.
+AR02_LEGACY_HEADERS = {
+    "anln1": "Activo fijo",
+    "anln2": "Subnúmero",
+    "denom": "Denominación del activo fijo",
+    "cap": "CAP actuales",
+    "baja": "Baja",
+    "amo_baja": "Amo baja",
+    "amo": "Amo acumulada",
+    "valcont": "Val.cont.act.",
+}
 # Mismo orden que la hoja DATA FINAL 2026 (columnas A:AJ).
 STATUS_HEADERS = [
     "DOC",
@@ -398,6 +460,17 @@ def read_ar02(
                     f"{path.name}; se encontraron {len(matches)}."
                 )
             column_indices[field] = matches[0]
+        legacy_matches = find_legacy_header(
+            normalized_headers, AR02_LEGACY_ASSET_HEADERS
+        )
+        if len(legacy_matches) == 1:
+            column_indices["legacy"] = legacy_matches[0]
+        elif len(legacy_matches) > 1:
+            raise ValueError(
+                "Hay más de una columna de N.º de activo antiguo (R3) en "
+                f"{path.name}: "
+                f"{', '.join(headers[index] for index in legacy_matches)}."
+            )
 
         records: list[tuple[int, list[Any]]] = []
         for source_row, cells in enumerate(rows, start=2):
@@ -421,6 +494,123 @@ def read_ar02(
     if not records:
         raise ValueError(f"No se encontraron activos válidos en {path.name}.")
     return headers, records, column_indices
+
+
+def find_legacy_header(
+    normalized_headers: list[str], aliases: set[str]
+) -> list[int]:
+    """Índices de la columna 'antigua': primero coincidencia exacta con un
+    alias; si no hay, encabezados que digan 'antigu'/'r3' junto a
+    'activo'/'af'/'placa'."""
+    exact = [
+        index
+        for index, header in enumerate(normalized_headers)
+        if header in aliases
+    ]
+    if exact:
+        return exact
+    loose = []
+    for index, header in enumerate(normalized_headers):
+        words = set(header.split())
+        if not words & {"antiguo", "antigua", "anterior", "r3"}:
+            continue
+        if words & {"activo", "af", "placa"}:
+            loose.append(index)
+    return loose
+
+
+def normalize_legacy_asset(value: Any) -> tuple[str, str]:
+    """'5600001082', '5600001082-0', 'AF 5600001082' -> ('5600001082', '0000').
+
+    Devuelve ('', '') si el valor no tiene forma de N.º de activo R3
+    (hasta 10 dígitos, con subnúmero opcional)."""
+    text = cell_text(value).removesuffix(".0").strip().upper()
+    text = re.sub(r"^(?:AF|ACTIVO|R3)\W*", "", text)
+    match = re.fullmatch(r"(\d{4,10})(?:\s*[-/ ]\s*(\d{1,4}))?", text)
+    if not match:
+        return "", ""
+    subnumber = match.group(2).zfill(4) if match.group(2) else ""
+    return match.group(1).zfill(10), subnumber
+
+
+def read_ar02_legacy(
+    folder: Path,
+) -> tuple[Path | None, dict[tuple[str, str], dict[str, Any]]]:
+    """Lee el AR02 ANTIGUO (R3). Clave: (activo R3 de 10 dígitos, subnúmero).
+
+    Si un mismo activo aparece en varias filas, se suman los importes."""
+    if not folder.is_dir():
+        return None, {}
+    try:
+        path = newest_excel(folder)
+    except FileNotFoundError:
+        return None, {}
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook.active
+        wanted = {
+            field: normalize_header(header)
+            for field, header in AR02_LEGACY_HEADERS.items()
+        }
+        header_row = None
+        indices: dict[str, int] = {}
+        for row_number, cells in enumerate(
+            worksheet.iter_rows(max_row=20, values_only=True), start=1
+        ):
+            normalized = [normalize_header(value) for value in cells]
+            found: dict[str, int] = {}
+            for field, header in wanted.items():
+                if header in normalized:
+                    found[field] = normalized.index(header)
+            if len(found) == len(wanted):
+                header_row, indices = row_number, found
+                break
+        if header_row is None:
+            missing = ", ".join(AR02_LEGACY_HEADERS.values())
+            raise ValueError(
+                f"No se encontró la fila de encabezados del AR02 ANTIGUO en "
+                f"{path.name} (se buscan: {missing})."
+            )
+
+        legacy: dict[tuple[str, str], dict[str, Any]] = {}
+        for source_row, cells in enumerate(
+            worksheet.iter_rows(min_row=header_row + 1, values_only=True),
+            start=header_row + 1,
+        ):
+            if len(cells) <= max(indices.values()):
+                continue
+            code, _ = normalize_legacy_asset(cells[indices["anln1"]])
+            if not code:
+                continue
+            subnumber = normalize_asset_subnumber(cells[indices["anln2"]]) or "0000"
+            entry = legacy.setdefault(
+                (code, subnumber),
+                {
+                    "denom": cell_text(cells[indices["denom"]]),
+                    "rows": [],
+                    **{field: Decimal(0) for field in ("cap", "baja", "amo_baja", "amo", "valcont")},
+                },
+            )
+            entry["rows"].append(source_row)
+            for field in ("cap", "baja", "amo_baja", "amo", "valcont"):
+                value = cells[indices[field]]
+                if isinstance(value, str) and value.startswith("="):
+                    continue  # fórmula sin valor guardado
+                try:
+                    entry[field] += amount_key(value) or Decimal(0)
+                except ValueError:
+                    continue
+    finally:
+        workbook.close()
+    return path, legacy
+
+
+def legacy_asset_state(entry: dict[str, Any]) -> str:
+    if entry["cap"] == 0 and (entry["baja"] != 0 or entry["amo_baja"] != 0):
+        return "BAJA EN AR02 ANTIGUO"
+    if entry["cap"] != 0 and entry["valcont"] == 0:
+        return "TOTALMENTE DEPRECIADO"
+    return ""
 
 
 def date_key(value: Any) -> Any:
@@ -1475,6 +1665,8 @@ def update_status_template(
     asset_book_value: Any,
     asset_denomination: Any,
     baja_documents: dict[str, set[tuple[str, datetime]]],
+    hana_from_r3: Any = None,
+    legacy_book_info: Any = None,
 ) -> dict[str, Any]:
     """Completa el STATUS sin tocar lo existente.
 
@@ -1582,6 +1774,27 @@ def update_status_template(
                 validation_cache[equipment] = resolve_equipment(equipment)
             return validation_cache[equipment]
 
+        def no_hana_detail(validation: dict[str, Any]) -> str:
+            parts = [validation.get("detail", "")]
+            legacy = validation.get("legacy") or {}
+            entry = legacy.get("entry")
+            if entry is not None:
+                parts.append(
+                    f"Solo en AR02 ANTIGUO: R3 {legacy['key'][0]}-"
+                    f"{legacy['key'][1]} '{entry['denom']}', CAP actuales "
+                    f"{entry['cap']}, Val.cont.act. {entry['valcont']}"
+                    + (f" ({legacy_asset_state(entry)})" if legacy_asset_state(entry) else "")
+                    + "."
+                )
+            elif legacy.get("code"):
+                parts.append(f"AF R3 {legacy['code']} no está en el AR02 ANTIGUO.")
+            return " ".join(part for part in parts if part)
+
+        def resolve_r3(r3_code: str) -> list[str]:
+            if not hana_from_r3 or not re.fullmatch(r"\d{10}", r3_code):
+                return []
+            return hana_from_r3(r3_code)
+
         # Pre-paso A: códigos HANAH previstos en filas existentes.
         for row_number in range(header_row + 1, last_data_row + 1):
             if cell_text(existing_value(row_number, "CODIGO AF HANAH")):
@@ -1591,6 +1804,12 @@ def update_status_template(
             )
             if validation.get("status") == "VALIDADO AR02":
                 hana_rows[validation["anln1"]] += 1
+            else:
+                r3_hana = resolve_r3(
+                    cell_text(existing_value(row_number, "CODIGO AF R3"))
+                )
+                if len(r3_hana) == 1:
+                    hana_rows[r3_hana[0]] += 1
 
         # Pre-paso B: registros de la BASE que aún no están en el STATUS.
         to_append: list[dict[str, Any]] = []
@@ -1650,9 +1869,23 @@ def update_status_template(
             row_number: int,
             equipment: str,
             existing_document: str = "",
+            validation: dict[str, Any] | None = None,
         ) -> list[tuple[str, Any, str]]:
             """Valores derivados del activo (AR02 + ACDOCA) para celdas vacías."""
             values: list[tuple[str, Any, str]] = []
+            legacy_info = (
+                legacy_book_info(hana, validation) if legacy_book_info else None
+            )
+            if legacy_info and legacy_info["alert"]:
+                review.append(
+                    [
+                        row_number,
+                        equipment,
+                        hana,
+                        "AR02 HANA EN 0; AR02 ANTIGUO CON VALOR",
+                        legacy_info["detail"],
+                    ]
+                )
             if not already_filled("VALOR CONTABLE"):
                 if hana_rows[hana] > 1:
                     review.append(
@@ -1666,7 +1899,7 @@ def update_status_template(
                         ]
                     )
                 else:
-                    book_value, source = asset_book_value(hana)
+                    book_value, source = asset_book_value(hana, validation)
                     if book_value is not None:
                         values.append(("VALOR CONTABLE", book_value, source))
             documents = sorted(baja_documents.get(hana, set()))
@@ -1725,7 +1958,11 @@ def update_status_template(
         for row_number in range(header_row + 1, last_data_row + 1):
             equipment = normalize_key(existing_value(row_number, "SERIE SAP"))
             hana = cell_text(existing_value(row_number, "CODIGO AF HANAH"))
-            if not equipment and not hana:
+            if (
+                not equipment
+                and not hana
+                and not cell_text(existing_value(row_number, "CODIGO AF R3"))
+            ):
                 continue
 
             def already_filled(header: str, row_number: int = row_number) -> bool:
@@ -1763,27 +2000,64 @@ def update_status_template(
                         )
                     )
                 else:
-                    if validation.get("status"):
-                        review.append(
-                            [
-                                row_number,
-                                equipment,
-                                "",
-                                f"SIN HANAH: {validation['status']}",
-                                validation.get("detail", ""),
-                            ]
+                    r3_hana = resolve_r3(r3_code)
+                    if len(r3_hana) == 1:
+                        hana = r3_hana[0]
+                        row_fills.append(
+                            (
+                                "CODIGO AF HANAH",
+                                hana,
+                                f"AR02 AF antiguo: R3 {r3_code} → {hana} "
+                                f"({asset_denomination(hana)})",
+                            )
                         )
-                    if re.fullmatch(r"\d{10}", r3_code):
-                        review.append(
-                            [
-                                row_number,
-                                equipment,
-                                "",
-                                "TIENE CODIGO AF R3 SIN HANAH",
-                                f"R3 {r3_code}: falta tabla de equivalencias "
-                                "R3 → HANA.",
-                            ]
-                        )
+                    else:
+                        if validation.get("status"):
+                            review.append(
+                                [
+                                    row_number,
+                                    equipment,
+                                    "",
+                                    f"SIN HANAH: {validation['status']}",
+                                    no_hana_detail(validation),
+                                ]
+                            )
+                        if len(r3_hana) > 1:
+                            review.append(
+                                [
+                                    row_number,
+                                    equipment,
+                                    "",
+                                    "CODIGO AF R3 CON VARIOS HANAH",
+                                    f"R3 {r3_code} → {', '.join(r3_hana)}.",
+                                ]
+                            )
+                        elif re.fullmatch(r"\d{10}", r3_code):
+                            review.append(
+                                [
+                                    row_number,
+                                    equipment,
+                                    "",
+                                    "TIENE CODIGO AF R3 SIN HANAH",
+                                    f"R3 {r3_code}: no figura como AF antiguo "
+                                    "en el AR02 HANA.",
+                                ]
+                            )
+
+            legacy = validation.get("legacy") or {}
+            if (
+                legacy.get("code")
+                and not r3_code
+                and not already_filled("CODIGO AF R3")
+                and (not re.fullmatch(r"\d{12}", hana) or hana == validation.get("anln1"))
+            ):
+                row_fills.append(
+                    (
+                        "CODIGO AF R3",
+                        legacy["code"],
+                        f"{legacy['source']}: equipo {equipment}",
+                    )
+                )
 
             if re.fullmatch(r"\d{12}", hana):
                 existing_document = cell_text(
@@ -1798,6 +2072,7 @@ def update_status_template(
                         existing_document
                         if existing_document.isdigit()
                         else "",
+                        validation,
                     )
                 )
 
@@ -1855,7 +2130,7 @@ def update_status_template(
                         equipment,
                         "",
                         f"SIN HANAH: {validation.get('status', '')}",
-                        validation.get("detail", ""),
+                        no_hana_detail(validation),
                     ]
                 )
             else:
@@ -1868,12 +2143,20 @@ def update_status_template(
                         "Ver hoja CANDIDATOS AR02 (sugerencias por descripción).",
                     ]
                 )
+            legacy = validation.get("legacy") or {}
+            if legacy.get("code"):
+                values["CODIGO AF R3"] = (
+                    legacy["code"],
+                    f"{legacy['source']}: equipo {equipment}",
+                )
             if hana:
                 for header, value, source in sap_values(
                     hana,
                     lambda header: header in values,
                     row_number,
                     equipment,
+                    "",
+                    validation,
                 ):
                     values[header] = (value, source)
 
@@ -1992,6 +2275,26 @@ def generate() -> Path:
             (source_row, record)
         )
         ar02_by_asset.setdefault(asset_code, []).append((source_row, record))
+    # Equivalencias R3 → HANA según la columna de activo antiguo del AR02.
+    ar02_by_legacy: dict[str, set[tuple[str, str]]] = {}
+    legacy_by_hana: dict[tuple[str, str], tuple[str, str]] = {}
+    legacy_column = ar02_column_indices.get("legacy")
+    if legacy_column is not None:
+        for source_row, record in ar02_records:
+            legacy_code, legacy_sub = normalize_legacy_asset(record[legacy_column])
+            if not legacy_code:
+                continue
+            hana_key = (
+                normalize_asset_code(record[ar02_column_indices["anln1"]]),
+                normalize_asset_subnumber(record[ar02_column_indices["anln2"]]),
+            )
+            ar02_by_legacy.setdefault(legacy_code, set()).add(hana_key)
+            legacy_by_hana[hana_key] = (legacy_code, legacy_sub or hana_key[1])
+    ar02_legacy_path, ar02_legacy = read_ar02_legacy(AR02_LEGACY_FOLDER)
+    ar02_legacy_by_code: dict[str, list[tuple[str, str]]] = {}
+    for legacy_key in ar02_legacy:
+        ar02_legacy_by_code.setdefault(legacy_key[0], []).append(legacy_key)
+
     # Índice nombre + centro (solo subnúmero 0000) para la ruta alternativa
     # cuando el activo que trae IH08 está en otro centro.
     ar02_by_name_center: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -2061,6 +2364,17 @@ def generate() -> Path:
             f"{export_path.name}; se encontraron {len(validity_matches)}."
         )
     validity_index = validity_matches[0]
+    ih08_plate_matches = find_legacy_header(
+        normalized_export_headers, IH08_LEGACY_PLATE_HEADERS
+    )
+    if len(ih08_plate_matches) > 1:
+        export_workbook.close()
+        raise ValueError(
+            "Hay más de una columna de placa antigua en "
+            f"{export_path.name}: "
+            f"{', '.join(export_headers[index] for index in ih08_plate_matches)}."
+        )
+    ih08_plate_index = ih08_plate_matches[0] if ih08_plate_matches else None
     export_records_with_rows = [
         (source_row, list(row))
         for source_row, row in enumerate(export_rows[1:], start=2)
@@ -2207,7 +2521,7 @@ def generate() -> Path:
             return next(iter(asset_codes)), "", True
         return next(iter(asset_codes)), next(iter(subnumbers), ""), False
 
-    def validate_ar02(
+    def validate_ar02_primary(
         rows: list[tuple[int, list[Any]]] | None,
     ) -> dict[str, Any]:
         if not rows:
@@ -2300,6 +2614,213 @@ def generate() -> Path:
             "record": matches[0][1],
             "route": route,
         }
+
+    def ar02_is_zero(record: list[Any]) -> bool:
+        return all(
+            (amount_key(record[index]) or Decimal(0)) == 0
+            for index in ar02_value_indices
+        )
+
+    def ih08_legacy_plate(rows: list[tuple[int, list[Any]]]) -> str:
+        if ih08_plate_index is None:
+            return ""
+        values = {
+            cell_text(record[ih08_plate_index])
+            for _, record in rows
+            if ih08_plate_index < len(record)
+        }
+        values.discard("")
+        values.discard("-")
+        return " / ".join(sorted(values))
+
+    def find_legacy_entry(
+        code: str, subnumber: str
+    ) -> tuple[tuple[str, str] | None, dict[str, Any] | None]:
+        if not code:
+            return None, None
+        keys = ar02_legacy_by_code.get(code, [])
+        if subnumber and (code, subnumber) in ar02_legacy:
+            key = (code, subnumber)
+        elif (code, "0000") in ar02_legacy and not subnumber:
+            key = (code, "0000")
+        elif len(keys) == 1 and not subnumber:
+            key = keys[0]
+        else:
+            return None, None
+        return key, ar02_legacy[key]
+
+    def hana_from_legacy(code: str, subnumber: str) -> tuple[list[tuple[str, str]], str]:
+        """Activos HANA cuyo 'AF antiguo' en el AR02 es el código R3 dado."""
+        keys = sorted(ar02_by_legacy.get(code, set()))
+        if subnumber:
+            keys = [key for key in keys if legacy_by_hana[key][1] == subnumber]
+        elif len(keys) > 1:
+            main = [key for key in keys if legacy_by_hana[key][1] == "0000"]
+            keys = main or keys
+        return keys, ""
+
+    def validate_ar02(
+        rows: list[tuple[int, list[Any]]] | None,
+    ) -> dict[str, Any]:
+        """Validación normal + respaldo por placa antigua / AF R3.
+
+        Si IH08 no lleva a un activo válido en AR02, o el activo HANA tiene
+        todos sus valores en 0, se busca el activo HANA por el código R3
+        (placa antigua de IH08 → columna AF antiguo del AR02). Además se
+        adjunta lo que dice el AR02 ANTIGUO de ese código R3."""
+        validation = validate_ar02_primary(rows)
+        if not rows or len(rows) != 1:
+            return validation
+
+        plate_raw = ih08_legacy_plate(rows)
+        plate_code, plate_sub = normalize_legacy_asset(plate_raw)
+        primary_ok = validation["status"] == "VALIDADO AR02"
+        primary_zero = primary_ok and ar02_is_zero(validation["record"])
+        mapped = (
+            legacy_by_hana.get((validation["anln1"], validation["anln2"]))
+            if primary_ok
+            else None
+        )
+        notes: list[str] = []
+        if plate_raw and not plate_code:
+            notes.append(
+                f"Placa antigua '{plate_raw}' no tiene formato de AF R3."
+            )
+        if plate_code and mapped and mapped[0] != plate_code:
+            notes.append(
+                f"Placa antigua IH08 {plate_code} ≠ AF antiguo del AR02 "
+                f"HANA {mapped[0]}."
+            )
+
+        r3_code, r3_sub, r3_source = "", "", ""
+        if plate_code:
+            r3_code, r3_sub, r3_source = plate_code, plate_sub, "IH08 placa antigua"
+        elif mapped:
+            r3_code, r3_sub = mapped
+            r3_source = "AR02 HANA: columna AF antiguo"
+        elif validation["status"] == "NO EXISTE EN AR02":
+            # IH08 quedó con el número R3 en vez del HANA.
+            candidate_code, _ = normalize_legacy_asset(
+                validation.get("anln1", "").lstrip("0")
+            )
+            if candidate_code and (
+                candidate_code in ar02_by_legacy
+                or candidate_code in ar02_legacy_by_code
+            ):
+                r3_code = candidate_code
+                r3_source = "IH08 Activo fijo con número R3"
+
+        if r3_code and r3_source != "AR02 HANA: columna AF antiguo" and (
+            not primary_ok or primary_zero
+        ):
+            hana_keys, _ = hana_from_legacy(r3_code, r3_sub)
+            if len(hana_keys) > 1:
+                notes.append(
+                    f"AF R3 {r3_code} corresponde a varios activos HANA: "
+                    + ", ".join(f"{a}-{s}" for a, s in hana_keys)
+                    + "."
+                )
+            elif hana_keys:
+                hana_key = hana_keys[0]
+                matches = ar02_by_key.get(hana_key, [])
+                current_key = (
+                    (validation["anln1"], validation["anln2"])
+                    if primary_ok
+                    else None
+                )
+                if len(matches) == 1 and hana_key != current_key and (
+                    not primary_ok or not ar02_is_zero(matches[0][1])
+                ):
+                    previous = validation["status"]
+                    if primary_ok:
+                        previous = (
+                            f"IH08 {current_key[0]}-{current_key[1]} con "
+                            "valores en 0"
+                        )
+                    validation = {
+                        "status": "VALIDADO AR02",
+                        "anln1": hana_key[0],
+                        "anln2": hana_key[1],
+                        "source_row": matches[0][0],
+                        "record": matches[0][1],
+                        "route": f"{r3_source.upper()} → AF R3 → AR02",
+                        "detail": f"Antes: {previous}.",
+                    }
+                    primary_ok = True
+            elif r3_source == "IH08 placa antigua" and ar02_by_legacy:
+                notes.append(
+                    f"AF R3 {r3_code} no figura como AF antiguo en el AR02 HANA."
+                )
+
+        legacy_key, legacy_entry = find_legacy_entry(
+            r3_code,
+            r3_sub or (validation.get("anln2", "") if primary_ok else ""),
+        )
+        validation["legacy"] = {
+            "plate": plate_raw,
+            "code": r3_code,
+            "subnumber": r3_sub,
+            "source": r3_source,
+            "notes": notes,
+            "key": legacy_key,
+            "entry": legacy_entry,
+        }
+        return validation
+
+    def legacy_output(validation: dict[str, Any]) -> list[Any]:
+        legacy = validation.get("legacy") or {}
+        code = legacy.get("code", "")
+        entry = legacy.get("entry")
+        key = legacy.get("key")
+        source = " | ".join(
+            part for part in [legacy.get("source", ""), *legacy.get("notes", [])]
+            if part
+        )
+        route = validation.get("route", "")
+        if not code:
+            return [route, legacy.get("plate", ""), "", source, *[""] * 9]
+        shown_code = f"{code}-{key[1]}" if key else code
+        if entry is None:
+            state = (
+                "NO EXISTE EN AR02 ANTIGUO"
+                if ar02_legacy
+                else "SIN ARCHIVO AR02 ANTIGUO"
+            )
+            return [route, legacy.get("plate", ""), shown_code, source, state, *[""] * 8]
+        record = validation.get("record")
+        if validation["status"] != "VALIDADO AR02" or record is None:
+            comparison = "SOLO EN AR02 ANTIGUO"
+        else:
+            def hana_amount(header: str) -> Decimal:
+                index = ar02_header_indices[normalize_header(header)]
+                return amount_key(record[index]) or Decimal(0)
+
+            cap = hana_amount("CAP actuales")
+            book = hana_amount("Val.cont.act.")
+            if ar02_is_zero(record) and (entry["cap"] != 0 or entry["valcont"] != 0):
+                comparison = "REVISAR: HANA EN 0, ANTIGUO CON VALOR"
+            elif abs(cap - entry["cap"]) <= Decimal("0.01") and abs(
+                book - entry["valcont"]
+            ) <= Decimal("0.01"):
+                comparison = "COINCIDE"
+            else:
+                comparison = "DIFERENTE"
+        return [
+            route,
+            legacy.get("plate", ""),
+            shown_code,
+            source,
+            "ENCONTRADO"
+            + (f" ({len(entry['rows'])} filas sumadas)" if len(entry["rows"]) > 1 else ""),
+            entry["denom"],
+            float(entry["cap"]),
+            float(entry["baja"]),
+            float(entry["amo"]),
+            float(entry["valcont"]),
+            legacy_asset_state(entry),
+            comparison,
+            " / ".join(str(row) for row in entry["rows"]),
+        ]
 
     acdoca_documents_by_asset: dict[tuple[str, str], dict[str, Any]] = {}
     for asset_key, movements in acdoca_by_asset_key.items():
@@ -2842,6 +3363,7 @@ def generate() -> Path:
                 "",
                 "",
                 "",
+                "",
                 *([None] * len(AR02_VALUE_HEADERS)),
                 "",
                 "",
@@ -2850,6 +3372,13 @@ def generate() -> Path:
                 "",
                 "",
             ]
+        ar02_output.extend(legacy_output(validation))
+        if len(ar02_output) != len(AR02_OUTPUT_HEADERS):
+            raise ValueError(
+                f"Fila BASE {base_source_row}: la salida AR02 tiene "
+                f"{len(ar02_output)} columnas y se esperaban "
+                f"{len(AR02_OUTPUT_HEADERS)}."
+            )
         ar02_output_by_base_row[base_source_row] = ar02_output
         accounting_output.extend(ar02_output)
 
@@ -2955,7 +3484,61 @@ def generate() -> Path:
     def ar02_amount(record: list[Any], header: str) -> Decimal:
         return amount_key(record[ar02_header_indices[normalize_header(header)]]) or Decimal(0)
 
-    def asset_book_value(asset_code: str) -> tuple[Decimal | None, str]:
+    def legacy_book_info(
+        asset_code: str, validation: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """Datos del AR02 ANTIGUO para un ANLN1 HANA (todas sus subnúmeros).
+
+        alert=True cuando el activo HANA está en 0 y el antiguo tiene valor."""
+        entries: dict[tuple[str, str], dict[str, Any]] = {}
+        legacy = (validation or {}).get("legacy") or {}
+        if (
+            validation
+            and validation.get("anln1") == asset_code
+            and legacy.get("entry") is not None
+        ):
+            entries[legacy["key"]] = legacy["entry"]
+        for (hana_code, hana_sub), (code, sub) in legacy_by_hana.items():
+            if hana_code != asset_code:
+                continue
+            key, entry = find_legacy_entry(code, sub)
+            if entry is not None:
+                entries[key] = entry
+        rows = ar02_by_asset.get(asset_code, [])
+        if not entries or not rows:
+            return None
+        hana_zero = all(ar02_is_zero(record) for _, record in rows)
+        disposal = sum(entry["baja"] for entry in entries.values())
+        if disposal != 0:
+            value = -(disposal + sum(e["amo_baja"] for e in entries.values()))
+            source = "AR02 ANTIGUO: valor neto dado de baja = -(Baja + Amo baja)"
+        else:
+            value = sum(entry["valcont"] for entry in entries.values())
+            source = "AR02 ANTIGUO: Val.cont.act."
+        codes = ", ".join(f"{code}-{sub}" for code, sub in sorted(entries))
+        has_value = any(
+            entry["cap"] != 0 or entry["valcont"] != 0 for entry in entries.values()
+        )
+        return {
+            "alert": hana_zero and has_value,
+            "value": value,
+            "source": f"{source} (R3 {codes})",
+            "detail": (
+                f"HANA {asset_code} tiene CAP/Val.cont. en 0. AR02 ANTIGUO "
+                f"R3 {codes}: CAP actuales "
+                f"{sum(e['cap'] for e in entries.values())}, Val.cont.act. "
+                f"{sum(e['valcont'] for e in entries.values())}, "
+                f"valor sugerido {value}."
+            ),
+        }
+
+    def hana_codes_from_r3(r3_code: str) -> list[str]:
+        code, _ = normalize_legacy_asset(r3_code)
+        return sorted({hana for hana, _ in ar02_by_legacy.get(code, set())})
+
+    def asset_book_value(
+        asset_code: str, validation: dict[str, Any] | None = None
+    ) -> tuple[Decimal | None, str]:
         """Valor contable para el STATUS (suma de subnúmeros del ANLN1).
 
         Si el activo tiene BAJA en AR02 se usa el valor neto dado de baja
@@ -2964,6 +3547,10 @@ def generate() -> Path:
         rows = ar02_by_asset.get(asset_code, [])
         if not rows:
             return None, ""
+        if USE_LEGACY_BOOK_VALUE_WHEN_HANA_IS_ZERO:
+            legacy_info = legacy_book_info(asset_code, validation)
+            if legacy_info and legacy_info["alert"]:
+                return legacy_info["value"], legacy_info["source"]
         disposal = sum(ar02_amount(record, "Baja") for _, record in rows)
         disposal_depreciation = sum(
             ar02_amount(record, "Amo baja") for _, record in rows
@@ -3432,6 +4019,56 @@ def generate() -> Path:
             candidate_high_score_count,
         ],
     ]
+    def ar02_column(row: list[Any], header: str) -> Any:
+        return row[AR02_OUTPUT_HEADERS.index(header)]
+
+    legacy_route_rows = [
+        source_row
+        for source_row, validation in validations_by_base_row.items()
+        if "AF R3" in validation.get("route", "")
+    ]
+    legacy_comparison_counts = Counter(
+        ar02_column(row, "COMPARACIÓN AR02 HANA VS ANTIGUO")
+        for row in ar02_output_by_base_row.values()
+        if ar02_column(row, "COMPARACIÓN AR02 HANA VS ANTIGUO")
+    )
+    legacy_state_counts = Counter(
+        ar02_column(row, "ESTADO AR02 ANTIGUO").split(" (")[0]
+        for row in ar02_output_by_base_row.values()
+        if ar02_column(row, "ESTADO AR02 ANTIGUO")
+    )
+    ar02_summary_records.extend(
+        [
+            [
+                "Columna AF antiguo en AR02 HANA",
+                ar02_headers[legacy_column] if legacy_column is not None else "NO ENCONTRADA",
+            ],
+            ["Activos HANA con AF antiguo (R3)", len(legacy_by_hana)],
+            [
+                "Columna placa antigua en IH08",
+                export_headers[ih08_plate_index]
+                if ih08_plate_index is not None
+                else "NO ENCONTRADA",
+            ],
+            [
+                "Archivo AR02 ANTIGUO",
+                ar02_legacy_path.name if ar02_legacy_path else "NO ENCONTRADO",
+            ],
+            ["Activos (R3 + subnúmero) en AR02 ANTIGUO", len(ar02_legacy)],
+            [
+                "Filas BASE validadas por placa antigua / AF R3",
+                len(legacy_route_rows),
+            ],
+            *[
+                [f"Filas BASE - AR02 ANTIGUO {state}", count]
+                for state, count in sorted(legacy_state_counts.items())
+            ],
+            *[
+                [f"Filas BASE - comparación HANA vs antiguo: {state}", count]
+                for state, count in sorted(legacy_comparison_counts.items())
+            ],
+        ]
+    )
     ar02_summary_records.extend(
         [
             [
@@ -3624,6 +4261,60 @@ def generate() -> Path:
             ),
         ],
     )
+    legacy_sheet_headers = [
+        "ID BASE",
+        "FILA BASE",
+        "EQUIPO",
+        "ESTADO VALIDACIÓN AR02",
+        "CLAVE ACTIVO AR02",
+        "DENOMINACIÓN AR02",
+        "CAP ACTUALES AR02",
+        "VALCONT ACTUAL AR02",
+        "DETALLE VALIDACIÓN",
+        *AR02_OUTPUT_HEADERS[AR02_OUTPUT_HEADERS.index("RUTA VALIDACIÓN AR02"):],
+    ]
+    legacy_sheet_records: list[list[Any]] = []
+    for base_record, base_source_row in zip(base_records, base_source_rows):
+        row = ar02_output_by_base_row[base_source_row]
+        validation = validations_by_base_row[base_source_row]
+        if not (
+            ar02_column(row, "AF R3 (ANTIGUO)")
+            or ar02_column(row, "PLACA ANTIGUA IH08")
+        ):
+            continue
+        legacy_sheet_records.append(
+            [
+                source_value(base_record, base_headers, "ID"),
+                base_source_row,
+                cell_text(base_record[BASE_EQUIPMENT_COLUMN - 1])
+                if len(base_record) >= BASE_EQUIPMENT_COLUMN
+                else "",
+                ar02_column(row, "ESTADO VALIDACIÓN AR02"),
+                ar02_column(row, "CLAVE ACTIVO AR02"),
+                ar02_column(row, "DENOMINACIÓN AR02"),
+                ar02_column(row, "CAP ACTUALES AR02"),
+                ar02_column(row, "VALCONT ACTUAL AR02"),
+                validation.get("detail", ""),
+                *row[AR02_OUTPUT_HEADERS.index("RUTA VALIDACIÓN AR02"):],
+            ]
+        )
+    add_records_sheet(
+        workbook,
+        "AR02 ANTIGUO - CRUCE",
+        legacy_sheet_headers,
+        legacy_sheet_records,
+        "CruceAR02Antiguo",
+        (
+            f"AR02 ANTIGUO: "
+            f"{ar02_legacy_path.name if ar02_legacy_path else 'no encontrado'}  |  "
+            f"{len(legacy_sheet_records)} filas BASE con placa antigua / AF R3  |  "
+            f"{len(legacy_route_rows)} validadas por AF R3"
+        ),
+        [
+            (1, 9, "BAJA / ACTIVO HANA", BLUE),
+            (10, len(legacy_sheet_headers), "PLACA ANTIGUA / AR02 ANTIGUO (R3)", GOLD),
+        ],
+    )
     add_records_sheet(
         workbook,
         "IH08 completo",
@@ -3727,6 +4418,8 @@ def generate() -> Path:
         asset_book_value,
         asset_denomination,
         baja_documents_by_asset,
+        hana_codes_from_r3,
+        legacy_book_info,
     )
     add_records_sheet(
         workbook,
@@ -3769,6 +4462,27 @@ def generate() -> Path:
     print(f"Base utilizada: {base_path.name}")
     print(f"Export utilizado: {export_path.name}")
     print(f"AR02 utilizado: {ar02_path.name}")
+    print(
+        "Columna AF antiguo en AR02: "
+        + (ar02_headers[legacy_column] if legacy_column is not None else "NO ENCONTRADA")
+        + f" ({len(legacy_by_hana)} activos HANA con código R3)"
+    )
+    print(
+        "Columna placa antigua en IH08: "
+        + (
+            export_headers[ih08_plate_index]
+            if ih08_plate_index is not None
+            else "NO ENCONTRADA"
+        )
+    )
+    print(
+        "AR02 ANTIGUO utilizado: "
+        + (ar02_legacy_path.name if ar02_legacy_path else "NO ENCONTRADO")
+        + f" ({len(ar02_legacy)} activos)"
+    )
+    print(f"Filas BASE validadas por placa antigua / AF R3: {len(legacy_route_rows)}")
+    for state, count in sorted(legacy_comparison_counts.items()):
+        print(f"  Comparación HANA vs antiguo - {state}: {count}")
     print(f"ACDOCA utilizado: {acdoca_path.name}")
     print(f"BKPF utilizado: {', '.join(path.name for path in bkpf_paths)}")
     print(f"Resultado creado: {output_path}")
