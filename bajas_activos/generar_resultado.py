@@ -95,7 +95,8 @@ ACDOCA_OUTPUT_HEADERS = [
 AR02_OUTPUT_HEADERS = [
     "ESTADO VALIDACIÓN AR02",
     "ESTADO MOVIMIENTOS ACDOCA",
-    "CLAVE ACTIVO AR02",
+    "ACTIVO FIJO AR02",
+    "SUBNÚMERO AR02",
     "DENOMINACIÓN AR02",
     "CUENTA BALANCE CAP AR02",
     "CLASE ACTIVOS AR02",
@@ -141,8 +142,12 @@ AR02_OUTPUT_HEADERS = [
 # Siempre se exige: candidato único (sin empate ni otro a menos de
 # DESCRIPTION_MIN_GAP puntos), los números de ambos textos compatibles
 # (N°1 ≠ N°2), y que el activo no esté tomado por otra ficha.
-DESCRIPTION_SUGGEST_SCORE = 88
+DESCRIPTION_SUGGEST_SCORE = 80
 DESCRIPTION_MIN_GAP = 5
+# Fichas con material que empieza con R: activo fijo no encontrado en base.
+MATERIAL_NOT_IN_BASE_PATTERN = re.compile(r"R\d+")
+STATUS_MATERIAL_R = "MATERIAL R: AF NO ENCONTRADO EN BASE"
+AF_NOT_FOUND_TEXT = "Activo fijo no encontrado en base"
 DESCRIPTION_STATUSES = {
     "EQUIPO SIN ACTIVO FIJO EN IH08",
     "BASE SIN CÓDIGO DE EQUIPO",
@@ -210,6 +215,15 @@ STATUS_FILL_DISPOSED = "CC99FF"
 STATUS_FILL_MISMATCH = "92D050"
 STATUS_FILL_SUGGESTED = "FFC000"
 STATUS_NOTE_HEADER = "COMENTARIOS2"
+STATUS_SUBNUMBER_HEADER = "SUBNUMERO AF HANAH"
+# Hoja 'STATUS BAJA 2026' del resultado: igual al STATUS + subnúmero al lado
+# del CODIGO AF HANAH.
+RESULT_SUBNUMBER_HEADER = "SUBNÚMERO AF HANAH"
+RESULT_STATUS_HEADERS = (
+    STATUS_HEADERS[: STATUS_HEADERS.index("CODIGO AF HANAH") + 1]
+    + [RESULT_SUBNUMBER_HEADER]
+    + STATUS_HEADERS[STATUS_HEADERS.index("CODIGO AF HANAH") + 1 :]
+)
 STATUS_TRACE_HEADERS = [
     "FILA STATUS",
     "TIPO DE FILA",
@@ -1762,6 +1776,7 @@ def update_status_template(
     legacy_book_info: Any = None,
     r3_legacy_detail: Any = None,
     asset_disposed: Any = None,
+    asset_subnumbers: Any = None,
 ) -> dict[str, Any]:
     """Completa el STATUS sin tocar lo existente.
 
@@ -1820,6 +1835,17 @@ def update_status_template(
         def column(header: str) -> int:
             return target_columns[normalize_header(header)]
 
+        # Columna para el subnúmero del AF HANAH (a la derecha de la tabla).
+        subnumber_header_written = False
+        if normalize_header(STATUS_SUBNUMBER_HEADER) in target_columns:
+            subnumber_column = target_columns[normalize_header(STATUS_SUBNUMBER_HEADER)]
+        else:
+            subnumber_column = len(STATUS_HEADERS) + 1
+            while cell_text(worksheet.cell(header_row, subnumber_column).value):
+                subnumber_column += 1
+            subnumber_header_written = True
+        subnumber_letter = openpyxl.utils.get_column_letter(subnumber_column)
+
         def letter(header: str) -> str:
             return openpyxl.utils.get_column_letter(column(header))
 
@@ -1839,7 +1865,23 @@ def update_status_template(
         # Índices de lo que ya existe en el STATUS.
         status_equipment: set[str] = set()
         status_fic: dict[str, list[tuple[str, str]]] = {}
-        hana_rows: Counter[str] = Counter()
+        def subnumber_of(hana: str, validation: dict[str, Any] | None) -> str:
+            """Subnúmero del HANAH: el de la validación o el único del AF;
+            '*' si no se puede saber (el AF tiene varios subnúmeros)."""
+            if validation and validation.get("anln1") == hana and validation.get("anln2"):
+                return validation["anln2"]
+            subnumbers = asset_subnumbers(hana) if asset_subnumbers else []
+            return subnumbers[0] if len(subnumbers) == 1 else "*"
+
+        def hana_conflict(hana: str, subnumber: str) -> bool:
+            total = sum(
+                count for (code, _), count in hana_rows.items() if code == hana
+            )
+            if subnumber == "*":
+                return total > 1
+            return hana_rows[(hana, subnumber)] > 1 or hana_rows[(hana, "*")] > 0
+
+        hana_rows: Counter[tuple[str, str]] = Counter()
         for row_number in range(header_row + 1, last_data_row + 1):
             equipment = normalize_key(existing_value(row_number, "SERIE SAP"))
             if equipment:
@@ -1858,7 +1900,10 @@ def update_status_template(
                 )
             hana = cell_text(existing_value(row_number, "CODIGO AF HANAH"))
             if re.fullmatch(r"\d{12}", hana):
-                hana_rows[hana] += 1
+                existing_sub = cell_text(
+                    worksheet.cell(row_number, subnumber_column).value
+                ) if subnumber_column <= worksheet.max_column else ""
+                hana_rows[(hana, existing_sub.zfill(4) if existing_sub.isdigit() else subnumber_of(hana, None))] += 1
 
         validation_cache: dict[str, dict[str, Any]] = {}
 
@@ -1894,6 +1939,27 @@ def update_status_template(
                 [row_number, "EXISTENTE (solo color)", equipment, header, "", reason]
             )
 
+        def write_subnumber(
+            row_number: int, row_type: str, equipment: str, hana: str,
+            validation: dict[str, Any] | None, color: str,
+        ) -> None:
+            existing = (
+                cell_text(worksheet.cell(row_number, subnumber_column).value)
+                if row_number <= last_data_row
+                else ""
+            )
+            subnumber = subnumber_of(hana, validation)
+            if existing or subnumber == "*":
+                return
+            updates.append(
+                (f"{subnumber_letter}{row_number}", subnumber, False, color)
+            )
+            fill_counts[STATUS_SUBNUMBER_HEADER] += 1
+            trace.append(
+                [row_number, row_type, equipment, STATUS_SUBNUMBER_HEADER,
+                 subnumber, f"Subnúmero del AF {hana}"]
+            )
+
         def no_hana_detail(validation: dict[str, Any]) -> str:
             parts = [validation.get("detail", ""), validation.get("note", "")]
             if validation.get("status") == "EQUIPO SIN ACTIVO FIJO EN IH08":
@@ -1925,13 +1991,13 @@ def update_status_template(
                 normalize_key(existing_value(row_number, "SERIE SAP"))
             )
             if validation.get("status") == "VALIDADO AR02":
-                hana_rows[validation["anln1"]] += 1
+                hana_rows[(validation["anln1"], validation["anln2"])] += 1
             else:
                 r3_hana = resolve_r3(
                     cell_text(existing_value(row_number, "CODIGO AF R3"))
                 )
                 if len(r3_hana) == 1:
-                    hana_rows[r3_hana[0]] += 1
+                    hana_rows[(r3_hana[0], subnumber_of(r3_hana[0], None))] += 1
 
         # Pre-paso B: registros de la BASE que aún no están en el STATUS.
         to_append: list[dict[str, Any]] = []
@@ -1961,9 +2027,16 @@ def update_status_template(
                 status_equipment.add(equipment)
             to_append.append(candidate)
             if candidate["validation"].get("status") == "VALIDADO AR02":
-                hana_rows[candidate["validation"]["anln1"]] += 1
+                hana_rows[
+                    (candidate["validation"]["anln1"], candidate["validation"]["anln2"])
+                ] += 1
 
-        updates: list[tuple[str, Any, bool]] = []
+        updates: list[tuple[str, Any, bool, str]] = []
+        if subnumber_header_written:
+            updates.append(
+                (f"{subnumber_letter}{header_row}", STATUS_SUBNUMBER_HEADER, False,
+                 STATUS_FILL_DEFAULT)
+            )
         fill_counts: Counter[str] = Counter()
         examples: list[tuple[int, str, Any]] = []
         trace: list[list[Any]] = []
@@ -2010,15 +2083,18 @@ def update_status_template(
                     ]
                 )
             if not already_filled("VALOR CONTABLE"):
-                if hana_rows[hana] > 1:
+                subnumber = subnumber_of(hana, validation)
+                if hana_conflict(hana, subnumber):
                     review.append(
                         [
                             row_number,
                             equipment,
                             hana,
                             "VALOR CONTABLE NO LLENADO",
-                            "El mismo CODIGO AF HANAH aparece en varias filas; "
-                            "el valor se reparte manualmente.",
+                            f"El AF {hana} (subnúmero {subnumber}) aparece en "
+                            "varias filas con el mismo subnúmero o sin "
+                            "subnúmero; revisar a qué subnúmero corresponde "
+                            "cada ficha.",
                         ]
                     )
                 else:
@@ -2113,10 +2189,10 @@ def update_status_template(
                         ]
                     )
                     mismatch_note = (
-                        f"REVISAR: HANAH del STATUS {hana} "
-                        f"({asset_denomination(hana)}) ≠ IH08 "
-                        f"{validation['anln1']} "
-                        f"({asset_denomination(validation['anln1'])})."
+                        "NO COINCIDEN: decidir entre (A) el AF del STATUS "
+                        f"{hana} '{asset_denomination(hana)}' o (B) el AF del "
+                        f"IH08 {validation['anln1']}-{validation['anln2']} "
+                        f"'{asset_denomination(validation['anln1'])}'."
                     )
                     mark(
                         row_number, equipment, "CODIGO AF HANAH",
@@ -2253,6 +2329,11 @@ def update_status_template(
                     row_number, "EXISTENTE", equipment, header, value, source,
                     row_colors.get(header, STATUS_FILL_DEFAULT),
                 )
+            if re.fullmatch(r"\d{12}", hana):
+                write_subnumber(
+                    row_number, "EXISTENTE", equipment, hana, validation,
+                    row_colors.get("CODIGO AF HANAH", STATUS_FILL_DEFAULT),
+                )
             if row_fills:
                 filled_existing_rows += 1
 
@@ -2282,6 +2363,11 @@ def update_status_template(
                     f"{validation.get('route', 'IH08')}: equipo {equipment} → "
                     f"{hana} ({asset_denomination(hana)})",
                 )
+            elif validation.get("status") == STATUS_MATERIAL_R:
+                values["CODIGO AF HANAH"] = (
+                    AF_NOT_FOUND_TEXT,
+                    validation.get("detail", "Material R"),
+                )
             elif equipment:
                 review.append(
                     [
@@ -2293,12 +2379,11 @@ def update_status_template(
                     ]
                 )
             else:
-                if candidate.get("material"):
-                    values["CODIGO AF HANAH"] = (
-                        "Activo fijo no encontrado en base",
-                        "Ficha sin código de equipo, con código de material "
-                        f"{candidate['material']}",
-                    )
+                values["CODIGO AF HANAH"] = (
+                    AF_NOT_FOUND_TEXT,
+                    "Ficha sin código de equipo; no se encontró por placa, "
+                    "AF R3, material ni descripción",
+                )
                 review.append(
                     [
                         row_number,
@@ -2350,6 +2435,13 @@ def update_status_template(
                     value,
                     source,
                     new_colors.get(header, STATUS_FILL_DEFAULT),
+                )
+            if hana:
+                write_subnumber(
+                    row_number,
+                    f"NUEVA (BASE fila {candidate['base_row']})",
+                    equipment, hana, validation,
+                    new_colors.get("CODIGO AF HANAH", STATUS_FILL_DEFAULT),
                 )
             new_rows.append((row_number, row_values))
             appended_base_rows += 1
@@ -2813,6 +2905,15 @@ def generate() -> Path:
             if index is not None
         )
 
+    def asset_has_movements(asset_code: str) -> bool:
+        # acdoca_documents_by_asset se arma más abajo; esta función solo se
+        # llama después de eso.
+        return any(
+            data.get("documents")
+            for (code, _), data in acdoca_documents_by_asset.items()
+            if code == asset_code
+        )
+
     def migrated_without_values(record: list[Any]) -> bool:
         """Activo HANA capitalizado en la migración (nov-dic 2025) y en 0."""
         text = cell_text(record[ar02_column_indices["capitalized"]])
@@ -3055,10 +3156,19 @@ def generate() -> Path:
             == "BAJA EN AR02"
             else ""
         )
+        zero_note = (
+            "AF HANA con todos los valores en 0 y sin movimientos: "
+            "probablemente mal migrado; se prioriza el AF antiguo (R3)."
+            if validation.get("record") is not None
+            and ar02_is_zero(validation["record"])
+            and not asset_has_movements(validation["anln1"])
+            else ""
+        )
         observation = " ".join(
             part
             for part in (
                 disposed_note,
+                zero_note,
                 validation.get("detail", ""),
                 validation.get("note", ""),
             )
@@ -3069,7 +3179,7 @@ def generate() -> Path:
         shown_code = f"{code}-{key[1]}" if key else code
         if entry is None:
             state = (
-                "NO EXISTE EN AR02 ANTIGUO"
+                "NO EXISTE EN AR02 ANTIGUO (falta en el archivo R3)"
                 if ar02_legacy
                 else "SIN ARCHIVO AR02 ANTIGUO"
             )
@@ -3091,6 +3201,10 @@ def generate() -> Path:
                 comparison = (
                     "USAR AR02 ANTIGUO: migrado nov-dic 2025 sin valores en HANA"
                 )
+            elif ar02_is_zero(record) and not asset_has_movements(
+                validation["anln1"]
+            ):
+                comparison = "USAR AR02 ANTIGUO: AF HANA en 0 y sin movimientos"
             elif ar02_is_zero(record) and entry["valcont"] != 0:
                 comparison = "REVISAR: HANA EN 0, ANTIGUO CON VALOR"
             elif ar02_is_zero(record) and entry["cap"] != 0:
@@ -3596,12 +3710,7 @@ def generate() -> Path:
             validation = validate_ar02(export_rows or None, base_plates, base_r3)
         initial_validations[base_source_row] = validation
 
-    # Paso 2: fichas sin activo -> descripción + centro contra AR02.
-    taken_assets = {
-        (validation["anln1"], validation["anln2"])
-        for validation in initial_validations.values()
-        if validation["status"] == "VALIDADO AR02"
-    }
+    # Paso 2: fichas sin activo -> material / descripción contra AR02.
     ar02_names_by_center: dict[str, list[tuple[str, tuple[str, str], str]]] = {}
     for (asset_code, subnumber), rows in ar02_by_key.items():
         if len(rows) != 1:
@@ -3642,97 +3751,181 @@ def generate() -> Path:
             )
         return ""
 
-    description_proposals: dict[int, dict[str, Any]] = {}
-    for base_record, base_source_row in zip(base_records, base_source_rows):
-        validation = initial_validations[base_source_row]
-        if validation["status"] not in DESCRIPTION_STATUSES:
-            continue
-        description = cell_text(
-            source_value(base_record, base_headers, "Descripción del equipo")
-        )
-        query = normalize_search_text(description)
-        equipment = normalize_key(
+    material_index = ar02_header_indices.get(normalize_header("Material"))
+    ar02_by_material: dict[str, set[tuple[str, str]]] = {}
+    if material_index is not None:
+        for _, record in ar02_records:
+            material = cell_text(record[material_index]).lstrip("0")
+            if material:
+                ar02_by_material.setdefault(material, set()).add(
+                    (
+                        normalize_asset_code(record[ar02_column_indices["anln1"]]),
+                        normalize_asset_subnumber(record[ar02_column_indices["anln2"]]),
+                    )
+                )
+
+    def ficha_equipment(base_record: list[Any]) -> str:
+        return normalize_key(
             base_record[BASE_EQUIPMENT_COLUMN - 1]
             if len(base_record) >= BASE_EQUIPMENT_COLUMN
             else None
         )
-        center = base_center(base_record, equipment)
-        candidates = list(ar02_names_by_center.get(center, []))
-        if center.startswith("fl"):
-            # La flota también tiene activos registrados en AG09.
-            candidates += ar02_names_by_center.get("ag09", [])
-        if not query or not candidates:
+
+    def ficha_materials(base_record: list[Any], equipment: str) -> list[str]:
+        materials = [cell_text(source_value(base_record, base_headers, "Código de material"))]
+        record = export_by_equipment.get(equipment) if equipment else None
+        if record is not None:
+            materials.append(cell_text(source_value(record, export_headers, "Material")))
+        return sorted({material.strip() for material in materials if material.strip()})
+
+    def ar02_name(key: tuple[str, str]) -> tuple[str, str]:
+        denomination = cell_text(ar02_by_key[key][0][1][ar02_column_indices["denom"]])
+        return normalize_search_text(denomination), denomination
+
+    # Regla: material que empieza con R -> activo fijo no encontrado en base.
+    for base_record, base_source_row in zip(base_records, base_source_rows):
+        validation = initial_validations[base_source_row]
+        if validation["status"] == "VALIDADO AR02":
             continue
-        scored = sorted(
-            (
-                (fuzz.token_sort_ratio(query, name), name, asset_key, denomination)
-                for name, asset_key, denomination in candidates
-                if numbers_compatible(query, name)
-            ),
-            reverse=True,
-        )
-        if not scored or scored[0][0] < DESCRIPTION_SUGGEST_SCORE:
-            continue
-        best_score, best_name, best_key, best_denomination = scored[0]
-        rivals = [
-            item for item in scored[1:]
-            if item[0] > best_score - DESCRIPTION_MIN_GAP
+        r_materials = [
+            material
+            for material in ficha_materials(base_record, ficha_equipment(base_record))
+            if MATERIAL_NOT_IN_BASE_PATTERN.fullmatch(material.upper())
         ]
-        description_proposals[base_source_row] = {
-            "score": round(best_score, 1),
-            "key": best_key,
-            "denomination": best_denomination,
-            "center": center,
+        if r_materials:
+            initial_validations[base_source_row] = {
+                "status": STATUS_MATERIAL_R,
+                "detail": f"Material {', '.join(r_materials)} empieza con R.",
+                "legacy": validation.get("legacy", {}),
+            }
+
+    # Propuestas por material + descripción y por descripción + centro.
+    proposals: dict[int, dict[str, Any]] = {}
+    for base_record, base_source_row in zip(base_records, base_source_rows):
+        validation = initial_validations[base_source_row]
+        if validation["status"] not in DESCRIPTION_STATUSES:
+            continue
+        query = normalize_search_text(
+            source_value(base_record, base_headers, "Descripción del equipo")
+        )
+        if not query:
+            continue
+        equipment = ficha_equipment(base_record)
+        options: list[tuple[float, tuple[str, str], str, str]] = []
+        for material in ficha_materials(base_record, equipment):
+            for key in ar02_by_material.get(material.lstrip("0"), ()):
+                if len(ar02_by_key.get(key, [])) != 1:
+                    continue
+                name, denomination = ar02_name(key)
+                if not numbers_compatible(query, name):
+                    continue
+                score = fuzz.token_sort_ratio(query, name)
+                if score >= DESCRIPTION_SUGGEST_SCORE:
+                    options.append(
+                        (score, key, denomination,
+                         f"SUGERIDO: MATERIAL {material} + DESCRIPCIÓN")
+                    )
+        if not options:
+            center = base_center(base_record, equipment)
+            candidates = list(ar02_names_by_center.get(center, []))
+            if center.startswith("fl"):
+                # La flota también tiene activos registrados en AG09.
+                candidates += ar02_names_by_center.get("ag09", [])
+            for name, key, denomination in candidates:
+                if not numbers_compatible(query, name):
+                    continue
+                score = fuzz.token_sort_ratio(query, name)
+                if score >= DESCRIPTION_SUGGEST_SCORE:
+                    options.append(
+                        (score, key, denomination,
+                         f"SUGERIDO: DESCRIPCIÓN + CENTRO {center.upper()}")
+                    )
+        if not options:
+            continue
+        options.sort(key=lambda option: (-option[0], option[1]))
+        best = options[0]
+        rivals = [
+            option for option in options[1:]
+            if option[0] > best[0] - DESCRIPTION_MIN_GAP
+            and option[1][0] != best[1][0]
+        ]
+        proposals[base_source_row] = {
+            "score": round(best[0], 1),
+            "key": best[1],
+            "route": best[3],
+            "query": query,
             "rivals": rivals,
         }
 
-    claims = Counter(
-        proposal["key"]
-        for proposal in description_proposals.values()
-        if not proposal["rivals"]
+    # Asignación: cada (AF, subnúmero) solo a una ficha. Si varias fichas
+    # piden el mismo AF, se reparten sus subnúmeros (overhaul, etc.).
+    taken_assets = {
+        (validation["anln1"], validation["anln2"])
+        for validation in initial_validations.values()
+        if validation["status"] == "VALIDADO AR02"
+    }
+    ordered = sorted(
+        proposals.items(), key=lambda item: (-item[1]["score"], item[0])
     )
-    for base_source_row, proposal in description_proposals.items():
+    for base_source_row, proposal in ordered:
         validation = initial_validations[base_source_row]
-        asset_key = proposal["key"]
-        reason = ""
+        asset_code = proposal["key"][0]
         if proposal["rivals"]:
-            reason = "empate con " + ", ".join(
-                f"{key[0]}-{key[1]} '{denomination}' ({round(score, 1)})"
-                for score, _, key, denomination in proposal["rivals"][:3]
-            )
-        elif asset_key in taken_assets:
-            reason = (
-                "el activo ya está asignado a otra ficha por IH08. "
-                + subnumbers_text(asset_key[0])
-            )
-        elif claims[asset_key] > 1:
-            reason = (
-                f"el mismo activo lo piden {claims[asset_key]} fichas. "
-                + subnumbers_text(asset_key[0])
-            )
-        label = (
-            f"SUGERIDO: DESCRIPCIÓN + CENTRO {proposal['center'].upper()} "
-            f"(puntaje {proposal['score']})"
-        )
-        if reason:
             validation["note"] = (
-                f"Candidato por descripción {asset_key[0]}-{asset_key[1]} "
-                f"'{proposal['denomination']}' ({label}) NO asignado: {reason}."
+                f"Candidato {proposal['key'][0]}-{proposal['key'][1]} NO "
+                "asignado: empate con "
+                + ", ".join(
+                    f"{key[0]}-{key[1]} '{denomination}' ({round(score, 1)})"
+                    for score, key, denomination, _ in proposal["rivals"][:3]
+                )
+                + "."
             )
             continue
-        matches = ar02_by_key[asset_key]
+        free_keys = [
+            key
+            for key in sorted(
+                (asset_code, cell_text(record[ar02_column_indices["anln2"]]))
+                for _, record in ar02_by_asset.get(asset_code, [])
+            )
+            if key not in taken_assets and len(ar02_by_key.get(key, [])) == 1
+        ]
+        if not free_keys:
+            validation["note"] = (
+                f"Candidato {asset_code} NO asignado: todos sus subnúmeros ya "
+                "están tomados por otras fichas. " + subnumbers_text(asset_code)
+            )
+            continue
+        key = max(
+            free_keys,
+            key=lambda item: (
+                item == proposal["key"],
+                fuzz.token_sort_ratio(proposal["query"], ar02_name(item)[0]),
+                [-ord(character) for character in item[1]],
+            ),
+        )
+        matches = ar02_by_key[key]
+        route = f"{proposal['route']} (puntaje {proposal['score']})"
+        note = ""
+        if key != proposal["key"]:
+            route += " → OTRO SUBNÚMERO"
+            note = (
+                f"El subnúmero {proposal['key'][1]} ya estaba tomado por otra "
+                f"ficha; se asignó el subnúmero {key[1]} "
+                f"('{ar02_name(key)[1]}'). " + subnumbers_text(asset_code)
+            )
         new_validation = {
             "status": "VALIDADO AR02",
             "suggested": True,
-            "anln1": asset_key[0],
-            "anln2": asset_key[1],
+            "anln1": key[0],
+            "anln2": key[1],
             "source_row": matches[0][0],
             "record": matches[0][1],
-            "route": label,
+            "route": route,
             "detail": f"Antes: {validation['status']}.",
+            "note": note,
             "legacy": validation.get("legacy", {}),
         }
-        mapped = legacy_by_hana.get(asset_key)
+        mapped = legacy_by_hana.get(key)
         if mapped and not new_validation["legacy"].get("code"):
             legacy_key, legacy_entry = find_legacy_entry(*mapped)
             new_validation["legacy"] = {
@@ -3744,7 +3937,31 @@ def generate() -> Path:
                 "entry": legacy_entry,
             }
         initial_validations[base_source_row] = new_validation
-        taken_assets.add(asset_key)
+        taken_assets.add(key)
+
+    # Mismo AF y mismo subnúmero en varias fichas: no tiene sentido.
+    key_counts = Counter(
+        (validation["anln1"], validation["anln2"])
+        for validation in initial_validations.values()
+        if validation["status"] == "VALIDADO AR02"
+    )
+    for validation in initial_validations.values():
+        if validation["status"] != "VALIDADO AR02":
+            continue
+        count = key_counts[(validation["anln1"], validation["anln2"])]
+        if count > 1:
+            validation["duplicate"] = count
+            validation["note"] = " ".join(
+                part
+                for part in (
+                    validation.get("note", ""),
+                    f"REVISAR: el AF {validation['anln1']} subnúmero "
+                    f"{validation['anln2']} está en {count} fichas (mismo AF y "
+                    "mismo subnúmero no tiene sentido). "
+                    + subnumbers_text(validation["anln1"]),
+                )
+                if part
+            )
 
     for base_record, base_source_row in zip(base_records, base_source_rows):
         key = normalize_key(
@@ -3805,7 +4022,8 @@ def generate() -> Path:
                     if documents
                     else "SIN MOVIMIENTOS EN ACDOCA"
                 ),
-                f'{validation["anln1"]}-{validation["anln2"]}',
+                validation["anln1"],
+                validation["anln2"],
                 ar02_record[ar02_column_indices["denom"]],
                 cap_account,
                 ar02_record[ar02_column_indices["clase"]],
@@ -3825,9 +4043,8 @@ def generate() -> Path:
             ar02_output = [
                 validation["status"],
                 "",
-                f'{validation["anln1"]}-{validation["anln2"]}'
-                if validation.get("anln1")
-                else "",
+                validation.get("anln1", ""),
+                validation.get("anln2", ""),
                 "",
                 "",
                 "",
@@ -3976,7 +4193,9 @@ def generate() -> Path:
         if not entries or not rows:
             return None
         hana_zero = all(ar02_is_zero(record) for _, record in rows)
-        migrated = any(migrated_without_values(record) for _, record in rows)
+        migrated = any(migrated_without_values(record) for _, record in rows) or (
+            hana_zero and not asset_has_movements(asset_code)
+        )
         disposal = sum(entry["baja"] for entry in entries.values())
         if disposal != 0:
             value = -(disposal + sum(e["amo_baja"] for e in entries.values()))
@@ -4028,11 +4247,20 @@ def generate() -> Path:
         rows = ar02_by_asset.get(asset_code, [])
         if not rows:
             return None, ""
+        subnumber_note = ""
+        if (
+            validation
+            and validation.get("anln1") == asset_code
+            and validation.get("anln2")
+            and len(rows) > 1
+        ):
+            rows = ar02_by_key.get((asset_code, validation["anln2"]), rows)
+            subnumber_note = f" (solo subnúmero {validation['anln2']})"
         legacy_info = legacy_book_info(asset_code, validation)
         if legacy_info and legacy_info["use_legacy"]:
             return (
                 legacy_info["value"],
-                "Migrado nov-dic 2025 sin valores en HANA → "
+                "AF HANA en 0 (migración nov-dic 2025 o sin movimientos) → "
                 + legacy_info["source"],
             )
         disposal = sum(ar02_amount(record, "Baja") for _, record in rows)
@@ -4042,11 +4270,17 @@ def generate() -> Path:
         if disposal != 0:
             return (
                 -(disposal + disposal_depreciation),
-                "AR02: valor neto dado de baja = -(Baja + Amo baja)",
+                "AR02: valor neto dado de baja = -(Baja + Amo baja)" + subnumber_note,
             )
         return (
             sum(ar02_amount(record, "Val.cont.act.") for _, record in rows),
-            "AR02: Val.cont.act.",
+            "AR02: Val.cont.act." + subnumber_note,
+        )
+
+    def asset_subnumbers(asset_code: str) -> list[str]:
+        return sorted(
+            cell_text(record[ar02_column_indices["anln2"]])
+            for _, record in ar02_by_asset.get(asset_code, [])
         )
 
     def asset_disposed(asset_code: str) -> bool:
@@ -4152,8 +4386,11 @@ def generate() -> Path:
         row_by_header["MES RECEPCION FICHA DE ESTADO"] = current_month.capitalize()
         if validation["status"] == "VALIDADO AR02":
             row_by_header["CODIGO AF HANAH"] = validation["anln1"]
+            row_by_header[RESULT_SUBNUMBER_HEADER] = validation["anln2"]
+        elif validation["status"] == STATUS_MATERIAL_R or not key:
+            row_by_header["CODIGO AF HANAH"] = AF_NOT_FOUND_TEXT
         status_records.append(
-            [row_by_header.get(header) for header in STATUS_HEADERS]
+            [row_by_header.get(header) for header in RESULT_STATUS_HEADERS]
             + [
                 *accounting_values,
                 accounting_status,
@@ -4524,6 +4761,8 @@ def generate() -> Path:
             return "PLACA → AR02"
         if route.startswith("SUGERIDO: DESCRIPCIÓN"):
             return "SUGERIDO: DESCRIPCIÓN + CENTRO"
+        if route.startswith("SUGERIDO: MATERIAL"):
+            return "SUGERIDO: MATERIAL + DESCRIPCIÓN"
         if route.startswith("PLACA R3"):
             return "PLACA R3 → AF R3 → AR02"
         return route
@@ -4609,7 +4848,7 @@ def generate() -> Path:
     acdoca_end_column = acdoca_start_column + len(ACDOCA_OUTPUT_HEADERS) - 1
     ar02_start_column = acdoca_end_column + 1
     ar02_end_column = len(merged_headers)
-    status_headers = STATUS_HEADERS + ACDOCA_OUTPUT_HEADERS + AR02_OUTPUT_HEADERS
+    status_headers = RESULT_STATUS_HEADERS + ACDOCA_OUTPUT_HEADERS + AR02_OUTPUT_HEADERS
     acdoca_status_counts = Counter(
         row[merged_headers.index("ESTADO CONCILIACIÓN ACDOCA")]
         for row in merged_records
@@ -4637,17 +4876,17 @@ def generate() -> Path:
         ),
         [
             (1, 8, "CONTROL Y REFERENCIA", BLUE),
-            (9, 21, "IDENTIFICACIÓN DEL ACTIVO", TEAL),
-            (22, 25, "BAJA Y CONTABILIDAD", BLUE),
-            (26, len(STATUS_HEADERS), "SEGUIMIENTO", GOLD),
+            (9, 22, "IDENTIFICACIÓN DEL ACTIVO", TEAL),
+            (23, 26, "BAJA Y CONTABILIDAD", BLUE),
+            (27, len(RESULT_STATUS_HEADERS), "SEGUIMIENTO", GOLD),
             (
-                len(STATUS_HEADERS) + 1,
-                len(STATUS_HEADERS) + len(ACDOCA_OUTPUT_HEADERS),
+                len(RESULT_STATUS_HEADERS) + 1,
+                len(RESULT_STATUS_HEADERS) + len(ACDOCA_OUTPUT_HEADERS),
                 "CONCILIACIÓN ACDOCA/BKPF",
                 TEAL,
             ),
             (
-                len(STATUS_HEADERS) + len(ACDOCA_OUTPUT_HEADERS) + 1,
+                len(RESULT_STATUS_HEADERS) + len(ACDOCA_OUTPUT_HEADERS) + 1,
                 len(status_headers),
                 "VALIDACIÓN AR02",
                 GOLD,
@@ -4775,7 +5014,8 @@ def generate() -> Path:
         "FILA BASE",
         "EQUIPO",
         "ESTADO VALIDACIÓN AR02",
-        "CLAVE ACTIVO AR02",
+        "ACTIVO FIJO AR02",
+        "SUBNÚMERO AR02",
         "DENOMINACIÓN AR02",
         "CAP ACTUALES AR02",
         "VALCONT ACTUAL AR02",
@@ -4801,7 +5041,8 @@ def generate() -> Path:
                 if len(base_record) >= BASE_EQUIPMENT_COLUMN
                 else "",
                 ar02_column(row, "ESTADO VALIDACIÓN AR02"),
-                ar02_column(row, "CLAVE ACTIVO AR02"),
+                ar02_column(row, "ACTIVO FIJO AR02"),
+                ar02_column(row, "SUBNÚMERO AR02"),
                 ar02_column(row, "DENOMINACIÓN AR02"),
                 ar02_column(row, "CAP ACTUALES AR02"),
                 ar02_column(row, "VALCONT ACTUAL AR02"),
@@ -4824,8 +5065,8 @@ def generate() -> Path:
             f"{len(legacy_route_rows)} recuperadas por rutas nuevas"
         ),
         [
-            (1, 9, "BAJA / ACTIVO HANA", BLUE),
-            (10, len(legacy_sheet_headers), "PLACA ANTIGUA / AR02 ANTIGUO (R3)", GOLD),
+            (1, 10, "BAJA / ACTIVO HANA", BLUE),
+            (11, len(legacy_sheet_headers), "PLACA ANTIGUA / AR02 ANTIGUO (R3)", GOLD),
         ],
     )
     add_records_sheet(
@@ -4935,6 +5176,7 @@ def generate() -> Path:
         legacy_book_info,
         r3_legacy_detail,
         asset_disposed,
+        asset_subnumbers,
     )
     add_records_sheet(
         workbook,
@@ -5014,6 +5256,57 @@ def generate() -> Path:
         "STATUS - REVISAR", "ALERTA", '{c}="HANAH DEL STATUS ≠ ACTIVO DE IH08"',
         STATUS_FILL_MISMATCH,
     )
+
+    legend = workbook.create_sheet("LEYENDA DE COLORES", 0)
+    legend.sheet_properties.tabColor = NAVY
+    legend["A1"] = "LEYENDA DE COLORES"
+    legend["A1"].font = Font(bold=True, size=14, color=NAVY)
+    legend_rows = [
+        ("STATUS (archivo Status_baja_actualizado) y este resultado", None, None),
+        ("", STATUS_FILL_DEFAULT,
+         "Amarillo: dato nuevo escrito por el script con información de SAP. "
+         "No requiere acción."),
+        ("", STATUS_FILL_SUGGESTED,
+         "Naranja: AF HANAH SUGERIDO (material + descripción, o descripción + "
+         "centro; fiabilidad desde 80%). No vino del IH08: CONFIRMAR."),
+        ("", STATUS_FILL_MISMATCH,
+         "Verde: el AF HANAH del STATUS no coincide con el del IH08. El valor no "
+         "se cambió; en COMENTARIOS2 dice entre cuáles decidir: (A) STATUS o "
+         "(B) IH08. DECIDIR."),
+        ("", STATUS_FILL_DISPOSED,
+         "Morado: el AF asignado ya se dio de baja anteriormente en el AR02. "
+         "REVISAR si es una baja repetida. (Si además es sugerido, gana el morado.)"),
+        ("", None, ""),
+        ("Textos especiales en CODIGO AF HANAH", None, None),
+        ("", None,
+         f"'{AF_NOT_FOUND_TEXT}': ficha sin código de equipo que no se encontró "
+         "por ninguna ruta, o ficha con material que empieza con R."),
+        ("", None, ""),
+        ("Columnas clave en el bloque AR02", None, None),
+        ("", None,
+         "ACTIVO FIJO AR02 / SUBNÚMERO AR02: el AF y su subnúmero en columnas "
+         "separadas. Un AF puede repetirse en varias fichas solo con distinto "
+         "subnúmero."),
+        ("", None,
+         "RUTA VALIDACIÓN AR02: cómo se encontró el AF (IH08, placa, AF R3, "
+         "SUGERIDO: material/descripción)."),
+        ("", None,
+         "OBSERVACIÓN ASIGNACIÓN: por qué se asignó o no, AF ya dado de baja, "
+         "AF en 0 sin movimientos, mismo AF y subnúmero en varias fichas."),
+        ("", None,
+         "COMPARACIÓN AR02 HANA VS ANTIGUO: 'USAR AR02 ANTIGUO' cuando el AF "
+         "HANA está en 0 (migración nov-dic 2025 o sin movimientos)."),
+    ]
+    for offset, (title, color, text) in enumerate(legend_rows, start=3):
+        if title:
+            legend.cell(offset, 1, title).font = Font(bold=True, color=NAVY)
+            continue
+        if color:
+            legend.cell(offset, 1).fill = PatternFill("solid", fgColor=color)
+        legend.cell(offset, 2, text).alignment = Alignment(wrap_text=True, vertical="top")
+    legend.column_dimensions["A"].width = 14
+    legend.column_dimensions["B"].width = 110
+    workbook.active = 0
 
     output_path = OUTPUT_FOLDER / f"Resultado_completo_{timestamp}.xlsx"
     suffix = 1
