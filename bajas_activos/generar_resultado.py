@@ -2412,6 +2412,16 @@ def update_status_template(
                     values[header] = (value, source)
 
             new_colors: dict[str, str] = {}
+            if not hana and validation.get("tie"):
+                new_colors["CODIGO AF HANAH"] = STATUS_FILL_MISMATCH
+                if STATUS_NOTE_HEADER not in values:
+                    new_colors[STATUS_NOTE_HEADER] = STATUS_FILL_MISMATCH
+                    values[STATUS_NOTE_HEADER] = (
+                        validation["note"], "Empate entre candidatos del AR02"
+                    )
+                tie_cell_marked = True
+            else:
+                tie_cell_marked = False
             if hana:
                 color, notes = hana_flags(hana, validation)
                 new_colors["CODIGO AF HANAH"] = color
@@ -2435,6 +2445,11 @@ def update_status_template(
                     value,
                     source,
                     new_colors.get(header, STATUS_FILL_DEFAULT),
+                )
+            if tie_cell_marked:
+                mark(
+                    row_number, equipment, "CODIGO AF HANAH",
+                    STATUS_FILL_MISMATCH, "Empate entre candidatos del AR02",
                 )
             if hana:
                 write_subnumber(
@@ -3852,6 +3867,7 @@ def generate() -> Path:
         proposals[base_source_row] = {
             "score": round(best[0], 1),
             "key": best[1],
+            "denomination": best[2],
             "route": best[3],
             "query": query,
             "rivals": rivals,
@@ -3871,15 +3887,18 @@ def generate() -> Path:
         validation = initial_validations[base_source_row]
         asset_code = proposal["key"][0]
         if proposal["rivals"]:
-            validation["note"] = (
-                f"Candidato {proposal['key'][0]}-{proposal['key'][1]} NO "
-                "asignado: empate con "
-                + ", ".join(
-                    f"{key[0]}-{key[1]} '{denomination}' ({round(score, 1)})"
-                    for score, key, denomination, _ in proposal["rivals"][:3]
-                )
-                + "."
-            )
+            options = [
+                (proposal["key"], proposal["denomination"], proposal["score"])
+            ] + [
+                (key, denomination, round(score, 1))
+                for score, key, denomination, _ in proposal["rivals"][:3]
+            ]
+            validation["tie"] = options
+            validation["note"] = "EMPATE: decidir entre " + " o ".join(
+                f"({chr(65 + index)}) {key[0]}-{key[1]} '{denomination}' "
+                f"({score}%)"
+                for index, (key, denomination, score) in enumerate(options)
+            ) + "."
             continue
         free_keys = [
             key
@@ -5256,6 +5275,14 @@ def generate() -> Path:
         "STATUS - REVISAR", "ALERTA", '{c}="HANAH DEL STATUS ≠ ACTIVO DE IH08"',
         STATUS_FILL_MISMATCH,
     )
+    for sheet_name in (
+        "Bajas completas", "Bajas sin IH08", "STATUS BAJA 2026",
+        "RECUPERACIÓN DE ACTIVOS",
+    ):
+        highlight_rows(
+            sheet_name, "OBSERVACIÓN ASIGNACIÓN", 'ISNUMBER(SEARCH("EMPATE",{c}))',
+            STATUS_FILL_MISMATCH, "ESTADO VALIDACIÓN AR02",
+        )
 
     legend = workbook.create_sheet("LEYENDA DE COLORES", 0)
     legend.sheet_properties.tabColor = NAVY
@@ -5270,9 +5297,10 @@ def generate() -> Path:
          "Naranja: AF HANAH SUGERIDO (material + descripción, o descripción + "
          "centro; fiabilidad desde 80%). No vino del IH08: CONFIRMAR."),
         ("", STATUS_FILL_MISMATCH,
-         "Verde: el AF HANAH del STATUS no coincide con el del IH08. El valor no "
-         "se cambió; en COMENTARIOS2 dice entre cuáles decidir: (A) STATUS o "
-         "(B) IH08. DECIDIR."),
+         "Verde: hay que DECIDIR. (1) El AF HANAH del STATUS no coincide con el "
+         "del IH08 (el valor no se cambió), o (2) EMPATE: varios activos del "
+         "AR02 calzan igual de bien con la ficha. En COMENTARIOS2 / OBSERVACIÓN "
+         "ASIGNACIÓN están las opciones (A), (B)..."),
         ("", STATUS_FILL_DISPOSED,
          "Morado: el AF asignado ya se dio de baja anteriormente en el AR02. "
          "REVISAR si es una baja repetida. (Si además es sugerido, gana el morado.)"),
